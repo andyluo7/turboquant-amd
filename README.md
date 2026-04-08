@@ -243,6 +243,69 @@ turboquant-amd/
 └── docs/                        # Architecture, kernel history, results
 ```
 
+
+---
+
+## Roadmap & Contributing
+
+We welcome contributions! Here are the key areas where help is needed:
+
+### 🔴 High Priority — Kernel Performance
+
+| Task | Description | Difficulty | Impact |
+|------|-------------|------------|--------|
+| **AITER turbo4 PA kernel** | Fork AITER's HIP paged attention to read turbo4 (4-bit nibble) KV directly in the attention inner loop. Target: match AITER FP8 speed (~48μs/layer). See [design doc](docs/design/AITER_TURBO4_DESIGN.md). | Hard | 10x decode speedup |
+| **Native FP4 MFMA on gfx950** | Use `mfma_scale_f32_16x16x128_f8f6f4` for hardware FP4 decode on MI355X. Currently returns zeros on ROCm 7.0.0 — needs testing on 7.0.1+. See [design doc](docs/design/MXFP4_PA_KERNEL.md). | Hard | 2x capacity at FP8 speed |
+| **Triton codegen optimization** | Current Triton kernels achieve only 3% HBM bandwidth utilization on ROCm (vs AITER's 61%). Profile and optimize the generated HIP assembly. | Hard | 3-10x kernel speedup |
+
+### 🟡 Medium Priority — Quality & Features
+
+| Task | Description | Difficulty | Impact |
+|------|-------------|------------|--------|
+| **Boundary layer protection** | Skip first 2 + last 2 layers (keep at full precision). Proven to recover 37-91% of quality gap. Easy to add. | Easy | Quality improvement |
+| **Outlier-aware mixed precision** | Per-layer channel variance calibration → high-variance channels get more bits (paper Section 4.3). See [Hyperloom reference](https://github.com/AMD-AGI/Hyperloom/tree/main/training_optimization/turboquant). | Medium | Quality improvement |
+| **Asymmetric K/V compression** | Compress V more aggressively than K (V compression is free — confirmed by [turboquant_plus](https://github.com/TheTom/turboquant_plus)). E.g., turbo4-K + turbo2-V. | Easy | Better compression ratio |
+| **Perplexity benchmark suite** | Add wikitext-2 / wikitext-103 PPL evaluation for all turbo configs. Currently only have GSM8K accuracy. | Easy | Quality validation |
+| **More model support** | Add `set_dflash_layers_to_capture` equivalent for DeepSeek-V3, Llama-4, Gemma-4 in vLLM. | Easy | Broader adoption |
+
+### 🟢 Low Priority — Integration & Ecosystem
+
+| Task | Description | Difficulty | Impact |
+|------|-------------|------------|--------|
+| **SGLang integration** | Port the vLLM backend to SGLang's attention framework. | Medium | New serving engine |
+| **llama.cpp turbo4 Metal kernel** | Register LUT decode for Apple Silicon (M-series). TheTom's fork already has turbo3. | Medium | Apple Silicon support |
+| **ONNX export** | Export TQ-compressed models to ONNX with custom ops. | Medium | Cross-platform |
+| **Quantization-aware training** | Fine-tune with TQ compression in the loop for better quality. | Hard | Quality at lower bits |
+| **Dynamic bit allocation** | Per-layer bit-width selection based on attention entropy. | Medium | Adaptive compression |
+
+### 🔧 Infrastructure
+
+| Task | Description | Difficulty |
+|------|-------------|------------|
+| **CI/CD pipeline** | GitHub Actions with MI300X self-hosted runner for kernel tests | Medium |
+| **Benchmark dashboard** | Automated throughput/quality tracking across commits | Medium |
+| **pip installable** | Make `pip install turboquant-amd` work cleanly | Easy |
+| **Documentation** | API docs, tutorials, integration guides | Easy |
+
+### Known Issues
+
+| Issue | Description | Workaround |
+|-------|-------------|------------|
+| Triton ROCm codegen | Only 3% HBM bandwidth utilization vs AITER's 61% | Use turbo4→FP8 pipeline for production |
+| `mfma_scale` zeros | `__builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4` returns all zeros on ROCm 7.0.0 | Needs ROCm 7.0.1+ testing |
+| Sparse-V v12 memory faults | Intermittent GPU memory access faults at ISL=31K conc=64 on MI355X | Root cause: Triton codegen + GPU-pair sensitivity |
+| AITER broken in SGLang Docker | Public SGLang ROCm images have broken AITER imports | `pip install -e .` inside container |
+| vLLM 50B compact KV NCCL crash | Non-power-of-2 slot size causes vectorized load overflow | Fixed: use 64B padded slots |
+
+### How to Contribute
+
+1. **Fork** the repo and create a feature branch
+2. **Test** on MI300X or MI355X with ROCm 7.0+
+3. **Benchmark** with the provided scripts in `benchmarks/`
+4. **Submit** a PR with test results
+
+For questions, open an issue or reach out to [@andyluo7](https://github.com/andyluo7).
+
 ---
 
 ## Citation
