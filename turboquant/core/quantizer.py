@@ -25,14 +25,40 @@ import torch
 
 @dataclass
 class PolarQuantConfig:
-    """Configuration for PolarQuant compression."""
+    """Configuration for PolarQuant compression.
+    
+    Supports asymmetric K/V compression: K and V can use different bit widths.
+    V compression is "free" quality-wise (errors average out in the weighted
+    sum during attention), so V can be compressed more aggressively.
+    
+    Example configurations:
+        - Symmetric turbo4: bits=4, v_bits=None → both K and V at 4-bit
+        - Asymmetric turbo4-K/turbo2-V: bits=4, v_bits=2 → K at 4-bit, V at 2-bit
+        - Asymmetric turbo4-K/turbo3-V: bits=4, v_bits=3 → K at 4-bit, V at 3-bit
+    """
 
     head_dim: int = 128
-    bits: int = 3  # 2, 3, or 4
+    bits: int = 3  # K bit width (2, 3, or 4)
+    v_bits: Optional[int] = None  # V bit width. None = same as K (symmetric)
     use_qjl: bool = True  # QJL correction for K (unbiased inner products)
     protect_boundary_layers: bool = True  # Skip compression on first/last N layers
     num_protected_layers: int = 2  # Number of layers to protect at each boundary
     num_layers: int = 0  # Total number of layers (set at init)
+
+    @property
+    def k_bits(self) -> int:
+        """Key bit width."""
+        return self.bits
+
+    @property
+    def effective_v_bits(self) -> int:
+        """Value bit width (falls back to k_bits if v_bits not set)."""
+        return self.v_bits if self.v_bits is not None else self.bits
+
+    @property
+    def is_asymmetric(self) -> bool:
+        """True if K and V use different bit widths."""
+        return self.v_bits is not None and self.v_bits != self.bits
 
     def should_compress(self, layer_idx: int) -> bool:
         """Return True if this layer should be compressed.
@@ -55,14 +81,30 @@ class PolarQuantConfig:
 
     @property
     def compression_ratio(self) -> float:
-        """Approximate compression ratio vs FP16."""
-        # FP16: 16 bits/element × D elements = 16D bits
-        # TQ: bits × D (indices) + D (signs, for turbo2/3) + 16 (norm)
-        if self.bits <= 3:
-            total_bits = self.bits * self.head_dim + self.head_dim + 16
-        else:
-            total_bits = self.bits * self.head_dim + 16  # No signs for turbo4
+        """Approximate compression ratio vs FP16 (symmetric, using K bits)."""
+        return self._compression_ratio_for_bits(self.bits)
+
+    @property
+    def k_compression_ratio(self) -> float:
+        """Compression ratio for keys."""
+        return self._compression_ratio_for_bits(self.k_bits)
+
+    @property
+    def v_compression_ratio(self) -> float:
+        """Compression ratio for values."""
+        return self._compression_ratio_for_bits(self.effective_v_bits)
+
+    @property
+    def combined_compression_ratio(self) -> float:
+        """Combined K+V compression ratio (harmonic mean of K and V ratios)."""
+        return 2.0 / (1.0 / self.k_compression_ratio + 1.0 / self.v_compression_ratio)
+
+    def _compression_ratio_for_bits(self, bits: int) -> float:
         fp16_bits = 16 * self.head_dim
+        if bits <= 3:
+            total_bits = bits * self.head_dim + self.head_dim + 16
+        else:
+            total_bits = bits * self.head_dim + 16
         return fp16_bits / total_bits
 
 

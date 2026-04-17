@@ -264,7 +264,7 @@ We welcome contributions! Here are the key areas where help is needed:
 |------|-------------|------------|--------|
 | ~~**Boundary layer protection**~~ | ✅ Done. `protect_boundary_layers=True` (default). Configurable via `num_protected_layers` (default 2). | Easy | Quality improvement |
 | **Outlier-aware mixed precision** | Per-layer channel variance calibration → high-variance channels get more bits (paper Section 4.3). See [Hyperloom reference](https://github.com/AMD-AGI/Hyperloom/tree/main/training_optimization/turboquant). | Medium | Quality improvement |
-| **Asymmetric K/V compression** | Compress V more aggressively than K (V compression is free — confirmed by [turboquant_plus](https://github.com/TheTom/turboquant_plus)). E.g., turbo4-K + turbo2-V. | Easy | Better compression ratio |
+| ~~**Asymmetric K/V compression**~~ | ✅ Done. `v_bits` parameter for independent V bit width. E.g., `k_bits=4, v_bits=2` for turbo4-K + turbo2-V. | Easy | Better compression ratio |
 | **Perplexity benchmark suite** | Add wikitext-2 / wikitext-103 PPL evaluation for all turbo configs. Currently only have GSM8K accuracy. | Easy | Quality validation |
 | **More model support** | Add `set_dflash_layers_to_capture` equivalent for DeepSeek-V3, Llama-4, Gemma-4 in vLLM. | Easy | Broader adoption |
 

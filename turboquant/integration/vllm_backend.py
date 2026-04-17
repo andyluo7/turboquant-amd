@@ -24,6 +24,24 @@ def make_wht_matrix(d: int, device: torch.device) -> torch.Tensor:
     return H[:d, :d]
 
 
+def _make_centroids(n: int, d: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
+    """Optimal n centroids for WHT-rotated vectors (Lloyd-Max).
+    
+    Returns: (centroids[n], boundaries[n-1])
+    """
+    sigma = 1.0 / math.sqrt(d)
+    centroids = []
+    for i in range(n):
+        lo = scipy_norm.ppf(max(i / n, 1e-10)) * sigma
+        hi = scipy_norm.ppf(min((i + 1) / n, 1 - 1e-10)) * sigma
+        num = sigma * (scipy_norm.pdf(lo / sigma) - scipy_norm.pdf(hi / sigma))
+        den = scipy_norm.cdf(hi / sigma) - scipy_norm.cdf(lo / sigma)
+        centroids.append(num / max(den, 1e-10))
+    boundaries = [(centroids[i] + centroids[i + 1]) / 2 for i in range(n - 1)]
+    return (torch.tensor(centroids, dtype=torch.float32),
+            torch.tensor(boundaries, dtype=torch.float32))
+
+
 def make_turbo4_centroids(d: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
     """Optimal 16 centroids for WHT-rotated vectors.
     
@@ -44,34 +62,73 @@ def make_turbo4_centroids(d: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 class TurboQuantFP8State:
-    """Per-layer state for turbo4→FP8 compression."""
+    """Per-layer state for turbo4→FP8 compression.
     
-    def __init__(self, head_size: int, layer_idx: int, device: torch.device):
+    Supports asymmetric K/V: K and V can use different centroid counts.
+    """
+    
+    def __init__(
+        self,
+        head_size: int,
+        layer_idx: int,
+        device: torch.device,
+        k_bits: int = 4,
+        v_bits: Optional[int] = None,
+    ):
         self.head_size = head_size
         self.layer_idx = layer_idx
         self.device = device
+        self.k_bits = k_bits
+        self.v_bits = v_bits if v_bits is not None else k_bits
         
         # WHT rotation matrix (orthogonal, its own inverse)
         self.wht = make_wht_matrix(head_size, device).half()
         self.PiT = self.wht.T  # pre-rotation for Q
         self.Pi = self.wht     # post-rotation for output
         
-        # Centroids and boundaries
-        centroids, boundaries = make_turbo4_centroids(head_size)
-        self.centroids = centroids.to(device)
-        self.boundaries = boundaries.to(device)
+        # K centroids and boundaries
+        k_centroids, k_boundaries = make_turbo4_centroids(head_size)
+        self.k_centroids = k_centroids.to(device)
+        self.k_boundaries = k_boundaries.to(device)
+        
+        # V centroids and boundaries (may differ if asymmetric)
+        if self.v_bits == self.k_bits:
+            self.v_centroids = self.k_centroids
+            self.v_boundaries = self.k_boundaries
+        else:
+            v_centroids, v_boundaries = _make_centroids(2 ** self.v_bits, head_size)
+            self.v_centroids = v_centroids.to(device)
+            self.v_boundaries = v_boundaries.to(device)
+        
+        # Backward compat aliases
+        self.centroids = self.k_centroids
+        self.boundaries = self.k_boundaries
     
-    def compress_to_fp8(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compress K or V tensor to FP8 via turbo4 pipeline.
+    def compress_to_fp8(
+        self, x: torch.Tensor, is_value: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compress K or V tensor to FP8 via turbo pipeline.
         
         Args:
             x: [T, H, D] fp16/bf16 — input K or V
+            is_value: If True, use V centroids (may be lower bit width
+                for asymmetric compression). Default False (K centroids).
             
         Returns:
             fp8_data: [T, H, D] fp8_e4m3 — compressed values in rotated space
             scales: [T, H, 1] float — per-position FP8 scales
         """
         T, H, D = x.shape
+        
+        # Select centroids based on K vs V
+        if is_value:
+            centroids = self.v_centroids
+            boundaries = self.v_boundaries
+            n_centroids = len(centroids)
+        else:
+            centroids = self.k_centroids
+            boundaries = self.k_boundaries
+            n_centroids = len(centroids)
         
         # Step 1: WHT rotation
         x_rot = torch.matmul(x.float(), self.wht.float())  # [T, H, D]
@@ -80,12 +137,12 @@ class TurboQuantFP8State:
         norms = x_rot.norm(dim=-1, keepdim=True)  # [T, H, 1]
         x_normalized = x_rot / (norms + 1e-8)  # [T, H, D]
         
-        # Step 3: Quantize to 16 centroids
-        indices = torch.searchsorted(self.boundaries, x_normalized.reshape(-1))
-        indices = indices.clamp(0, 15).reshape(T, H, D)
+        # Step 3: Quantize to centroids
+        indices = torch.searchsorted(boundaries, x_normalized.reshape(-1))
+        indices = indices.clamp(0, n_centroids - 1).reshape(T, H, D)
         
         # Step 4: Dequantize in rotated space
-        dequantized = self.centroids[indices] * norms  # [T, H, D]
+        dequantized = centroids[indices] * norms  # [T, H, D]
         
         # Step 5: Convert to FP8 E4M3 with per-position scale
         abs_max = dequantized.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
@@ -147,8 +204,9 @@ def turbo4_fp8_compress_and_scatter(
         fp8_data = (x.float() / scales).to(torch.float8_e4m3fnuz)
         # Fall through to scatter below
     else:
-        # Turbo4 compression → FP8
-        fp8_data, scales = state.compress_to_fp8(x)
+        # TurboQuant compression → FP8 (asymmetric: K vs V use different centroids)
+        is_value = (kv_idx == 1)
+        fp8_data, scales = state.compress_to_fp8(x, is_value=is_value)
     
     # Update the per-tensor/per-head scale for AITER PA
     # AITER uses a single k_scale/v_scale for the entire cache
@@ -194,11 +252,15 @@ class TurboQuantFP8Config:
         num_layers: int = 0,
         protect_boundary_layers: bool = True,
         num_protected_layers: int = 2,
+        k_bits: int = 4,
+        v_bits: Optional[int] = None,
     ):
         self.head_size = head_size
         self.num_layers = num_layers
         self.protect_boundary_layers = protect_boundary_layers
         self.num_protected_layers = num_protected_layers
+        self.k_bits = k_bits
+        self.v_bits = v_bits  # None = same as k_bits
         self.layer_states: dict[int, TurboQuantFP8State] = {}
     
     def should_compress(self, layer_idx: int) -> bool:
@@ -221,7 +283,9 @@ class TurboQuantFP8Config:
             return None  # Protected layer — use standard FP8
         if layer_idx not in self.layer_states:
             self.layer_states[layer_idx] = TurboQuantFP8State(
-                self.head_size, layer_idx, device)
+                self.head_size, layer_idx, device,
+                k_bits=self.k_bits, v_bits=self.v_bits,
+            )
         return self.layer_states[layer_idx]
 
 
@@ -233,6 +297,8 @@ def get_tq_fp8_config(
     num_layers: int = 0,
     protect_boundary_layers: bool = True,
     num_protected_layers: int = 2,
+    k_bits: int = 4,
+    v_bits: Optional[int] = None,
 ) -> TurboQuantFP8Config:
     """Get or create TurboQuant FP8 config.
     
@@ -243,6 +309,20 @@ def get_tq_fp8_config(
             Default True. Set to False for maximum compression.
         num_protected_layers: Layers to protect at each boundary (default 2).
             With 40 layers and N=2: layers 0,1,38,39 stay at full FP8.
+        k_bits: Key compression bit width (2, 3, or 4). Default 4.
+        v_bits: Value compression bit width. None = same as k_bits (symmetric).
+            Set to 2 or 3 for asymmetric K/V compression.
+            V compression is quality-free (errors average out in attention).
+    
+    Examples:
+        # Symmetric turbo4 (default)
+        config = get_tq_fp8_config(k_bits=4)
+        
+        # Asymmetric: turbo4-K + turbo2-V (best compression)
+        config = get_tq_fp8_config(k_bits=4, v_bits=2)
+        
+        # Asymmetric: turbo4-K + turbo3-V (balanced)
+        config = get_tq_fp8_config(k_bits=4, v_bits=3)
     """
     global _tq_fp8_config
     if _tq_fp8_config is None:
@@ -251,5 +331,7 @@ def get_tq_fp8_config(
             num_layers=num_layers,
             protect_boundary_layers=protect_boundary_layers,
             num_protected_layers=num_protected_layers,
+            k_bits=k_bits,
+            v_bits=v_bits,
         )
     return _tq_fp8_config
