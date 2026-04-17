@@ -30,6 +30,24 @@ class PolarQuantConfig:
     head_dim: int = 128
     bits: int = 3  # 2, 3, or 4
     use_qjl: bool = True  # QJL correction for K (unbiased inner products)
+    protect_boundary_layers: bool = True  # Skip compression on first/last N layers
+    num_protected_layers: int = 2  # Number of layers to protect at each boundary
+    num_layers: int = 0  # Total number of layers (set at init)
+
+    def should_compress(self, layer_idx: int) -> bool:
+        """Return True if this layer should be compressed.
+        
+        When protect_boundary_layers is True, the first and last
+        `num_protected_layers` layers are kept at full precision.
+        This recovers 37-91% of quantization quality gap (Section 4.3).
+        """
+        if not self.protect_boundary_layers or self.num_layers == 0:
+            return True
+        if layer_idx < self.num_protected_layers:
+            return False
+        if layer_idx >= self.num_layers - self.num_protected_layers:
+            return False
+        return True
 
     @property
     def n_centroids(self) -> int:

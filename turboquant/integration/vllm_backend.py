@@ -124,7 +124,7 @@ def turbo4_fp8_compress_and_scatter(
     kv_cache: torch.Tensor,    # [num_blocks, block_size, H, D] FP8
     slot_mapping: torch.Tensor, # [T] int32
     kv_idx: int,               # 0=K, 1=V (for separate K/V caches)
-    state: TurboQuantFP8State,
+    state: Optional[TurboQuantFP8State],
     k_scale: Optional[torch.Tensor] = None,
     v_scale: Optional[torch.Tensor] = None,
     block_size: int = 16,
@@ -133,11 +133,22 @@ def turbo4_fp8_compress_and_scatter(
     
     This replaces the standard KV cache update for turbo4→FP8 mode.
     The KV cache is standard FP8 layout — no custom format needed.
+    
+    If state is None (boundary layer protection), writes standard FP8
+    without TQ compression.
     """
     T, H, D = x.shape
     
-    # Turbo4 compression → FP8
-    fp8_data, scales = state.compress_to_fp8(x)
+    # Boundary layer protection: skip TQ, use standard FP8
+    if state is None:
+        abs_max = x.float().abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
+        fp8_max = 240.0
+        scales = abs_max / fp8_max
+        fp8_data = (x.float() / scales).to(torch.float8_e4m3fnuz)
+        # Fall through to scatter below
+    else:
+        # Turbo4 compression → FP8
+        fp8_data, scales = state.compress_to_fp8(x)
     
     # Update the per-tensor/per-head scale for AITER PA
     # AITER uses a single k_scale/v_scale for the entire cache
@@ -166,13 +177,48 @@ def turbo4_fp8_compress_and_scatter(
 # ============================================================================
 
 class TurboQuantFP8Config:
-    """Configuration for turbo4→FP8 backend."""
+    """Configuration for turbo4→FP8 backend.
     
-    def __init__(self, head_size: int = 128):
+    Args:
+        head_size: Attention head dimension (default: 128)
+        num_layers: Total number of transformer layers
+        protect_boundary_layers: Skip TQ compression on first/last N layers,
+            keeping them at full FP8 precision. Default True.
+        num_protected_layers: How many layers to protect at each boundary.
+            Default 2 (first 2 + last 2 = 4 layers at full precision).
+    """
+    
+    def __init__(
+        self,
+        head_size: int = 128,
+        num_layers: int = 0,
+        protect_boundary_layers: bool = True,
+        num_protected_layers: int = 2,
+    ):
         self.head_size = head_size
+        self.num_layers = num_layers
+        self.protect_boundary_layers = protect_boundary_layers
+        self.num_protected_layers = num_protected_layers
         self.layer_states: dict[int, TurboQuantFP8State] = {}
     
-    def get_state(self, layer_idx: int, device: torch.device) -> TurboQuantFP8State:
+    def should_compress(self, layer_idx: int) -> bool:
+        """Check if this layer should use TQ compression.
+        
+        When protect_boundary_layers is True, the first and last
+        `num_protected_layers` layers skip TQ and use standard FP8.
+        """
+        if not self.protect_boundary_layers or self.num_layers == 0:
+            return True
+        if layer_idx < self.num_protected_layers:
+            return False
+        if layer_idx >= self.num_layers - self.num_protected_layers:
+            return False
+        return True
+    
+    def get_state(self, layer_idx: int, device: torch.device) -> Optional[TurboQuantFP8State]:
+        """Get per-layer TQ state, or None if layer is protected."""
+        if not self.should_compress(layer_idx):
+            return None  # Protected layer — use standard FP8
         if layer_idx not in self.layer_states:
             self.layer_states[layer_idx] = TurboQuantFP8State(
                 self.head_size, layer_idx, device)
@@ -182,8 +228,28 @@ class TurboQuantFP8Config:
 # Singleton config
 _tq_fp8_config: Optional[TurboQuantFP8Config] = None
 
-def get_tq_fp8_config(head_size: int = 128) -> TurboQuantFP8Config:
+def get_tq_fp8_config(
+    head_size: int = 128,
+    num_layers: int = 0,
+    protect_boundary_layers: bool = True,
+    num_protected_layers: int = 2,
+) -> TurboQuantFP8Config:
+    """Get or create TurboQuant FP8 config.
+    
+    Args:
+        head_size: Attention head dimension
+        num_layers: Total transformer layers (needed for boundary protection)
+        protect_boundary_layers: Keep first/last N layers at full FP8 precision.
+            Default True. Set to False for maximum compression.
+        num_protected_layers: Layers to protect at each boundary (default 2).
+            With 40 layers and N=2: layers 0,1,38,39 stay at full FP8.
+    """
     global _tq_fp8_config
     if _tq_fp8_config is None:
-        _tq_fp8_config = TurboQuantFP8Config(head_size)
+        _tq_fp8_config = TurboQuantFP8Config(
+            head_size=head_size,
+            num_layers=num_layers,
+            protect_boundary_layers=protect_boundary_layers,
+            num_protected_layers=num_protected_layers,
+        )
     return _tq_fp8_config

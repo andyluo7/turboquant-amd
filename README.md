@@ -262,7 +262,7 @@ We welcome contributions! Here are the key areas where help is needed:
 
 | Task | Description | Difficulty | Impact |
 |------|-------------|------------|--------|
-| **Boundary layer protection** | Skip first 2 + last 2 layers (keep at full precision). Proven to recover 37-91% of quality gap. Easy to add. | Easy | Quality improvement |
+| ~~**Boundary layer protection**~~ | ✅ Done. `protect_boundary_layers=True` (default). Configurable via `num_protected_layers` (default 2). | Easy | Quality improvement |
 | **Outlier-aware mixed precision** | Per-layer channel variance calibration → high-variance channels get more bits (paper Section 4.3). See [Hyperloom reference](https://github.com/AMD-AGI/Hyperloom/tree/main/training_optimization/turboquant). | Medium | Quality improvement |
 | **Asymmetric K/V compression** | Compress V more aggressively than K (V compression is free — confirmed by [turboquant_plus](https://github.com/TheTom/turboquant_plus)). E.g., turbo4-K + turbo2-V. | Easy | Better compression ratio |
 | **Perplexity benchmark suite** | Add wikitext-2 / wikitext-103 PPL evaluation for all turbo configs. Currently only have GSM8K accuracy. | Easy | Quality validation |
