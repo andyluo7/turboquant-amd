@@ -255,7 +255,7 @@ We welcome contributions! Here are the key areas where help is needed:
 | Task | Description | Difficulty | Impact |
 |------|-------------|------------|--------|
 | **AITER turbo4 PA kernel** | Fork AITER's HIP paged attention to read turbo4 (4-bit nibble) KV directly in the attention inner loop. Target: match AITER FP8 speed (~48μs/layer). See [design doc](docs/design/AITER_TURBO4_DESIGN.md). | Hard | 10x decode speedup |
-| **Native FP4 MFMA on gfx950** | Use `mfma_scale_f32_16x16x128_f8f6f4` for hardware FP4 decode on MI355X. Currently returns zeros on ROCm 7.0.0 — needs testing on 7.0.1+. See [design doc](docs/design/MXFP4_PA_KERNEL.md). | Hard | 2x capacity at FP8 speed |
+| **Native FP4 MFMA on gfx950** — *further perf tuning needed* | 🟡 Correctness ✅, perf optimization 🚧. AITER PA fork uses `mfma_scale_f32_16x16x128_f8f6f4` (mixed FP8×FP4, scale=1.0) on MI355X with ROCm 7.2.0. Native path now always-on (`TQ_FP4_NATIVE_THRESHOLD=0`); shuffle reorientation bug fixed (cosine ≥ 0.995 at S=256..65536). **Native is 1.07× → 1.26× faster than the FP4→FP8 LUT path across S=4K..64K, no crossover.** **Storage: 2× KV capacity (verified, 0.5 B/elem).** Roofline: only **13.5% of HBM peak BW** at S=64K — kernel is memory-bound with significant headroom. **Remaining work:** (1) BLOCK_SIZE 16→32/64 to widen contiguous fetches, (2) profile/fuse the partial+reduce two-stage kernel at large `npar`, (3) async LDS prefetch to hide HBM latency, (4) per-block scaling for full MXFP4, (5) end-to-end vLLM model bench. See [design doc](docs/design/MXFP4_PA_KERNEL.md). | Hard | 2× KV bytes; ≥1.26× over LUT today, ~3× headroom to BW peak |
 | **Triton codegen optimization** | Current Triton kernels achieve only 3% HBM bandwidth utilization on ROCm (vs AITER's 61%). Profile and optimize the generated HIP assembly. | Hard | 3-10x kernel speedup |
 
 ### 🟡 Medium Priority — Quality & Features
@@ -292,7 +292,7 @@ We welcome contributions! Here are the key areas where help is needed:
 | Issue | Description | Workaround |
 |-------|-------------|------------|
 | Triton ROCm codegen | Only 3% HBM bandwidth utilization vs AITER's 61% | Use turbo4→FP8 pipeline for production |
-| `mfma_scale` zeros | `__builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4` returns all zeros on ROCm 7.0.0 | Needs ROCm 7.0.1+ testing |
+| `mfma_scale` zeros (resolved) | E8M0 scale byte = `0x00` is `2^-127 ≈ 0` (not 1.0) — the apparent "zeros bug" was a scale-encoding error | Pass `0x7F` (= 1.0) when no scaling is desired |
 | Sparse-V v12 memory faults | Intermittent GPU memory access faults at ISL=31K conc=64 on MI355X | Root cause: Triton codegen + GPU-pair sensitivity |
 | AITER broken in SGLang Docker | Public SGLang ROCm images have broken AITER imports | `pip install -e .` inside container |
 | vLLM 50B compact KV NCCL crash | Non-power-of-2 slot size causes vectorized load overflow | Fixed: use 64B padded slots |
