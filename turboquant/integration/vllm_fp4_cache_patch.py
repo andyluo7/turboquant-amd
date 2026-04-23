@@ -514,6 +514,21 @@ def _make_fp4_forward(orig_fn):
         if has_decode and not has_prefill:
             import ctypes
 
+            # One-shot diagnostic
+            if not hasattr(_fp4_forward, '_diag_done'):
+                _fp4_forward._diag_done = True
+                import sys
+                print(f"[TQ-DIAG] kv_cache shape={kv_cache.shape} stride={kv_cache.stride()} "
+                      f"dtype={kv_cache.dtype} contiguous={kv_cache.is_contiguous()} "
+                      f"device={kv_cache.device}", file=sys.stderr, flush=True)
+                print(f"[TQ-DIAG] query shape={query.shape} dtype={query.dtype}", file=sys.stderr, flush=True)
+                print(f"[TQ-DIAG] block_table shape={attn_metadata.block_table.shape} dtype={attn_metadata.block_table.dtype}", file=sys.stderr, flush=True)
+                print(f"[TQ-DIAG] seq_lens shape={attn_metadata.seq_lens.shape} dtype={attn_metadata.seq_lens.dtype}", file=sys.stderr, flush=True)
+                # Check first few cache bytes
+                bt0 = attn_metadata.block_table[0, 0].item()
+                cache_slice = kv_cache[bt0, 0, 0, 0, :10].view(torch.uint8)
+                print(f"[TQ-DIAG] cache[block={bt0},K,pos=0,head=0,:10] = {cache_slice.tolist()}", file=sys.stderr, flush=True)
+
             # Load unified kernel (takes single [N,2,bs,kv_heads,68] tensor)
             if not hasattr(_fp4_forward, '_lib_u'):
                 import os
