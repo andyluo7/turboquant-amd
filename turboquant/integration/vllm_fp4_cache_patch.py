@@ -491,6 +491,12 @@ def _make_fp4_forward(orig_fn):
         if attn_metadata is None:
             return output.fill_(0)
 
+        # Detect decode vs prefill
+        num_decode_tokens = getattr(attn_metadata, 'num_decode_tokens',
+                                     query.shape[0])
+        has_decode = num_decode_tokens > 0
+        has_prefill = query.shape[0] > num_decode_tokens
+
         # kv_cache: [num_blocks, 2, block_size, num_kv_heads, 68] int8
         num_blocks = kv_cache.shape[0]
         block_size = kv_cache.shape[2]
@@ -499,95 +505,55 @@ def _make_fp4_forward(orig_fn):
         head_dim = self.head_size     # 128
         packed_dim = head_dim // 2    # 64
         scale_dim = head_dim // 32    # 4
-
-        # CUDA-graph-safe dequant: use index_select on block_table indices.
-        # No .unique(), .flatten(), or dynamic allocation — all ops are
-        # fixed-shape tensor operations that can be captured in a graph.
         import torch
 
-        block_table = attn_metadata.block_table  # [batch, max_blocks_per_seq] int32
-        if block_table is not None and block_table.numel() > 0:
-            batch_size = block_table.shape[0]
-            max_blocks_per_seq = block_table.shape[1]
+        # ── DECODE: use FP4 PA v9 kernel directly (no dequant!) ──
+        if has_decode and not has_prefill:
+            # Pure decode — use PA v9 kernel which reads FP4 natively
+            from turboquant.integration.tq_fp4_backend import fp4_paged_attention_v9
 
-            # Clamp block indices to valid range (padding may use -1 or large values)
-            bt_clamped = block_table.clamp(min=0, max=num_blocks - 1).long()
+            # Extract K/V cache and scales from the interleaved layout
+            # kv_cache: [num_blocks, 2, block_size, num_kv_heads, 68] int8
+            key_cache_fp4 = kv_cache[:, 0]  # [num_blocks, bs, kv_heads, 68]
+            val_cache_fp4 = kv_cache[:, 1]
 
-            # Gather all referenced blocks: [batch * max_blocks_per_seq, 2, bs, kv_heads, 68]
-            bt_flat = bt_clamped.reshape(-1)  # [batch * max_blocks_per_seq]
-            gathered_kv = kv_cache[bt_flat]   # index_select on dim 0 — graph-safe
+            # Split packed data and scales
+            k_cache = key_cache_fp4[..., :packed_dim].contiguous().view(torch.uint8)
+            v_cache_data = val_cache_fp4[..., :packed_dim].contiguous().view(torch.uint8)
+            k_scale = key_cache_fp4[..., packed_dim:packed_dim + scale_dim].contiguous().view(torch.uint8)
+            v_scale = val_cache_fp4[..., packed_dim:packed_dim + scale_dim].contiguous().view(torch.uint8)
 
-            # Reshape to [batch, max_blocks_per_seq, 2, block_size, kv_heads, 68]
-            gathered_kv = gathered_kv.reshape(
-                batch_size, max_blocks_per_seq, 2, block_size, num_kv_heads, fp4_dim
+            # Query: vLLM gives [num_tokens, num_heads, head_dim]
+            # PA v9 expects [batch, num_heads, head_dim] (same for decode)
+            batch = num_decode_tokens
+            q_for_kernel = query[:batch].contiguous()
+
+            block_table = attn_metadata.block_table[:batch].contiguous().to(torch.int32)
+            ctx_lens = attn_metadata.seq_lens[:batch].to(torch.int32).contiguous()
+
+            fp4_out = fp4_paged_attention_v9(
+                query=q_for_kernel,
+                k_cache=k_cache,
+                v_cache=v_cache_data,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                block_tables=block_table,
+                context_lens=ctx_lens,
+                scale=self.scale,
             )
 
-            # Dequantize: split K/V, extract packed data and scales
-            gathered_k = gathered_kv[:, :, 0]  # [batch, max_blk, bs, kv_heads, 68]
-            gathered_v = gathered_kv[:, :, 1]
+            # Copy PA v9 output to vLLM output buffer
+            output[:batch].copy_(fp4_out[:batch])
+            return output
 
-            k_packed = gathered_k[..., :packed_dim].contiguous().view(torch.uint8)
-            k_scales = gathered_k[..., packed_dim:packed_dim + scale_dim].contiguous().view(torch.uint8)
-            v_packed = gathered_v[..., :packed_dim].contiguous().view(torch.uint8)
-            v_scales = gathered_v[..., packed_dim:packed_dim + scale_dim].contiguous().view(torch.uint8)
-
-            k_bf16 = dequantize_fp4_e2m1(k_packed, k_scales, head_dim)
-            v_bf16 = dequantize_fp4_e2m1(v_packed, v_scales, head_dim)
-
-            # Reshape back to paged format: [batch * max_blocks_per_seq, 2, bs, kv_heads, head_dim]
-            n_gathered = batch_size * max_blocks_per_seq
-            k_bf16 = k_bf16.reshape(n_gathered, block_size, num_kv_heads, head_dim)
-            v_bf16 = v_bf16.reshape(n_gathered, block_size, num_kv_heads, head_dim)
-            kv_cache_bf16 = torch.stack([k_bf16, v_bf16], dim=1)
-            # kv_cache_bf16: [n_gathered, 2, block_size, kv_heads, head_dim]
-
-            # Remap block_table to sequential indices [0, 1, 2, ...]
-            block_table_remapped = torch.arange(
-                n_gathered, dtype=torch.int32, device=block_table.device
-            ).reshape(batch_size, max_blocks_per_seq)
-
-            # Replace block_table in metadata
-            if hasattr(attn_metadata, '_replace'):
-                attn_metadata = attn_metadata._replace(block_table=block_table_remapped)
-            else:
-                attn_metadata.block_table = block_table_remapped
-        else:
-            # No block_table (prefill only) — create empty bf16 cache
-            kv_cache_bf16 = torch.zeros(
-                (1, 2, block_size, num_kv_heads, head_dim),
-                dtype=torch.bfloat16, device=kv_cache.device,
-            )
-
-        # Call the original forward with bf16 cache.
-        # We need to temporarily pretend this isn't a quantized cache.
-        # Temporarily override cache dtype so original forward treats
-        # our bf16 cache as unquantized. Guard attribute access since
-        # TritonAttentionImpl may not have all RocmAttentionImpl attrs.
-        saved = {}
-        for attr in ('kv_cache_dtype', '_kv_quant_mode', '_is_per_token_head_quant'):
-            if hasattr(self, attr):
-                saved[attr] = getattr(self, attr)
-        try:
-            if hasattr(self, 'kv_cache_dtype'):
-                self.kv_cache_dtype = "auto"
-            if hasattr(self, '_kv_quant_mode'):
-                try:
-                    from vllm.v1.kv_cache_interface import get_kv_quant_mode
-                    self._kv_quant_mode = get_kv_quant_mode("auto")
-                except ImportError:
-                    pass
-            if hasattr(self, '_is_per_token_head_quant'):
-                self._is_per_token_head_quant = False
-
-            result = orig_fn(
-                self, layer, query, key, value, kv_cache_bf16,
-                attn_metadata, output, output_scale, output_block_scale,
-            )
-        finally:
-            for attr, val in saved.items():
-                setattr(self, attr, val)
-
-        return result
+        # ── PREFILL or MIXED: fall through to original with standard cache ──
+        # For prefill, the fresh K/V are bf16 and get written to cache
+        # by do_kv_cache_update. The prefill attention uses fresh K/V
+        # directly (not from cache), so int8 cache dtype doesn't matter.
+        return orig_fn(
+            self, layer, query, key, value, kv_cache,
+            attn_metadata, output, output_scale, output_block_scale,
+        )
 
     return _fp4_forward
 
