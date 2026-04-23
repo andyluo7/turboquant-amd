@@ -426,38 +426,21 @@ def _make_fp4_do_kv_cache_update(orig_fn):
         scale_dim = head_dim // 32   # 4
         block_size = key_cache.shape[1]
 
-        # WHT rotation before FP4 quantization:
-        # Rotate K/V into WHT space where coordinates are ~i.i.d. Gaussian,
-        # enabling near-optimal scalar quantization. Since H is self-inverse,
-        # Q must also be rotated before the PA kernel: Q_rot @ K_rot^T = Q @ K^T
-        from turboquant.core.rotation import make_wht_matrix
-        if not hasattr(_fp4_do_kv_cache_update, '_H'):
-            _fp4_do_kv_cache_update._H = make_wht_matrix(
-                head_dim, device=key.device
-            ).to(key.dtype)
-        elif _fp4_do_kv_cache_update._H.device != key.device:
-            _fp4_do_kv_cache_update._H = _fp4_do_kv_cache_update._H.to(key.device)
-        H = _fp4_do_kv_cache_update._H
-
-        # Rotate: [N, H, D] @ [D, D] → [N, H, D]
-        key_rot = key @ H
-        value_rot = value @ H
-
-        # Quantize rotated K and V to FP4
+        # Quantize K and V to FP4 using turbo4 compress
+        # (proper E8M0 scaling with max/6.0 + searchsorted boundaries)
         from turboquant.integration.tq_fp4_backend import turbo4_compress_to_fp4
-        k_packed, k_scales = turbo4_compress_to_fp4(key_rot)
-        v_packed, v_scales = turbo4_compress_to_fp4(value_rot)
+        k_packed, k_scales = turbo4_compress_to_fp4(key)
+        v_packed, v_scales = turbo4_compress_to_fp4(value)
 
         # Concatenate packed data and scales along last dim → [N, H, 68]
         k_fp4 = torch.cat([
             k_packed.view(torch.int8),
             k_scales.view(torch.int8),
-        ], dim=-1)  # [num_tokens, num_kv_heads, 68]
-
+        ], dim=-1)
         v_fp4 = torch.cat([
             v_packed.view(torch.int8),
             v_scales.view(torch.int8),
-        ], dim=-1)  # [num_tokens, num_kv_heads, 68]
+        ], dim=-1)
 
         # Scatter-write into cache using slot_mapping
         # slot_mapping[i] maps token i → (block_idx * block_size + block_offset)
@@ -549,16 +532,6 @@ def _make_fp4_forward(orig_fn):
             # Kernel indexes K at dim1=0 and V at dim1=1 internally
             # Avoid unnecessary copies — only convert if needed
             q = query[:batch]
-            # Rotate Q into WHT space to match rotated K/V in cache
-            # Q_rot @ K_rot^T = (Q @ H) @ (K @ H)^T = Q @ H @ H^T @ K^T = Q @ K^T
-            from turboquant.core.rotation import make_wht_matrix
-            if not hasattr(_fp4_forward, '_H'):
-                _fp4_forward._H = make_wht_matrix(
-                    head_dim, device=q.device
-                ).to(q.dtype)
-            elif _fp4_forward._H.device != q.device:
-                _fp4_forward._H = _fp4_forward._H.to(q.device)
-            q = q @ _fp4_forward._H
             if not q.is_contiguous():
                 q = q.contiguous()
             bt = attn_metadata.block_table[:batch]
@@ -603,11 +576,7 @@ def _make_fp4_forward(orig_fn):
                 ctypes.c_void_p(stream),
             )
 
-            # Un-rotate output: kernel computed softmax(Q_rot @ K_rot^T) @ V_rot
-            # Since V_rot = V @ H, output = desired_output @ H
-            # Un-rotate: output_final = output @ H (H is self-inverse)
-            fp4_out_derot = fp4_out[:batch].float() @ _fp4_forward._H.float()
-            output[:batch].copy_(fp4_out_derot.to(output.dtype))
+            output[:batch].copy_(fp4_out[:batch])
             return output
 
         # ── PREFILL or MIXED: fall through to original with standard cache ──
