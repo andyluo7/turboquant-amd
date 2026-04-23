@@ -494,24 +494,12 @@ def _make_fp4_forward(orig_fn):
         if attn_metadata is None:
             return output.fill_(0)
 
-        # Detect decode vs prefill
-        num_decode_tokens = getattr(attn_metadata, 'num_decode_tokens',
-                                     query.shape[0])
-        has_decode = num_decode_tokens > 0
-        has_prefill = query.shape[0] > num_decode_tokens
-
-        # Extended diagnostic (first 5 calls)
-        if not hasattr(_fp4_forward, '_call_count'):
-            _fp4_forward._call_count = 0
-        _fp4_forward._call_count += 1
-        if _fp4_forward._call_count <= 5:
-            import sys
-            print(f"[TQ-FWD #{_fp4_forward._call_count}] query={query.shape} "
-                  f"num_decode={num_decode_tokens} has_decode={has_decode} "
-                  f"has_prefill={has_prefill} "
-                  f"block_table={getattr(attn_metadata, 'block_table', None) is not None and attn_metadata.block_table.shape} "
-                  f"seq_lens={getattr(attn_metadata, 'seq_lens', None) is not None and attn_metadata.seq_lens[:min(3, attn_metadata.seq_lens.shape[0])].tolist()}",
-                  file=sys.stderr, flush=True)
+        # Detect decode vs prefill:
+        # Pure decode = 1 token per sequence, seq_lens > 1 (has cached context)
+        # Prefill = multiple tokens, seq_lens == num_tokens (no cached context yet)
+        num_seqs = attn_metadata.block_table.shape[0] if hasattr(attn_metadata, 'block_table') and attn_metadata.block_table is not None else 1
+        num_tokens = query.shape[0]
+        is_pure_decode = (num_tokens == num_seqs)  # 1 token per sequence = decode
 
         # kv_cache: [num_blocks, 2, block_size, num_kv_heads, 68] int8
         num_blocks = kv_cache.shape[0]
@@ -524,7 +512,7 @@ def _make_fp4_forward(orig_fn):
         import torch
 
         # ── DECODE: use FP4 PA v9u unified kernel (single cache pointer) ──
-        if has_decode and not has_prefill:
+        if is_pure_decode:
             import ctypes
 
             # One-shot diagnostic
@@ -553,7 +541,7 @@ def _make_fp4_forward(orig_fn):
                 logger.info("[TQ-FP4] Loaded unified PA kernel: %s", so_u)
             lib = _fp4_forward._lib_u
 
-            batch = num_decode_tokens
+            batch = num_seqs
             num_heads_q = query.shape[1] if query.dim() == 3 else self.num_heads
 
             # Pass the ENTIRE kv_cache tensor — no slicing, no .contiguous()
