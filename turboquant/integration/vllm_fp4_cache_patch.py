@@ -500,24 +500,57 @@ def _make_fp4_forward(orig_fn):
         packed_dim = head_dim // 2    # 64
         scale_dim = head_dim // 32    # 4
 
-        # Dequantize the ENTIRE FP4 cache to bf16 temporary tensors.
-        # This is O(num_blocks * block_size) but correct.
-        # Cache layout: [num_blocks, 2, block_size, num_kv_heads, 68]
-        key_cache_fp4, value_cache_fp4 = kv_cache.unbind(1)
-        # Each: [num_blocks, block_size, num_kv_heads, 68] int8
+        # Selective dequant: only dequantize blocks referenced by current batch.
+        # Full-cache dequant is too expensive (OOM with ~800K blocks).
+        # We gather only the active blocks via block_table, dequant those,
+        # and build a compact bf16 cache with remapped block indices.
+        import torch
 
-        # Extract packed data and scales
-        k_packed = key_cache_fp4[..., :packed_dim].view(torch.uint8)
-        k_scales = key_cache_fp4[..., packed_dim:packed_dim + scale_dim].view(torch.uint8)
-        v_packed = value_cache_fp4[..., :packed_dim].view(torch.uint8)
-        v_scales = value_cache_fp4[..., packed_dim:packed_dim + scale_dim].view(torch.uint8)
+        block_table = attn_metadata.block_table  # [batch, max_blocks_per_seq] int32
+        if block_table is not None and block_table.numel() > 0:
+            # Get unique blocks actually referenced
+            unique_blocks = block_table.flatten().unique()
+            # Remove padding (-1 or 0 depending on vLLM version)
+            unique_blocks = unique_blocks[unique_blocks >= 0]
+            n_active = unique_blocks.shape[0]
 
-        # Dequantize to bf16: [num_blocks, block_size, num_kv_heads, head_dim]
-        k_bf16 = dequantize_fp4_e2m1(k_packed, k_scales, head_dim)
-        v_bf16 = dequantize_fp4_e2m1(v_packed, v_scales, head_dim)
+            # Gather active blocks from FP4 cache
+            # kv_cache: [num_blocks, 2, block_size, num_kv_heads, 68]
+            active_kv = kv_cache[unique_blocks]  # [n_active, 2, bs, kv_heads, 68]
 
-        # Build temporary bf16 kv_cache: [num_blocks, 2, block_size, num_kv_heads, head_dim]
-        kv_cache_bf16 = torch.stack([k_bf16, v_bf16], dim=1)
+            # Dequantize only active blocks
+            active_k, active_v = active_kv.unbind(1)
+            k_packed = active_k[..., :packed_dim].view(torch.uint8)
+            k_scales = active_k[..., packed_dim:packed_dim + scale_dim].view(torch.uint8)
+            v_packed = active_v[..., :packed_dim].view(torch.uint8)
+            v_scales = active_v[..., packed_dim:packed_dim + scale_dim].view(torch.uint8)
+
+            k_bf16 = dequantize_fp4_e2m1(k_packed, k_scales, head_dim)
+            v_bf16 = dequantize_fp4_e2m1(v_packed, v_scales, head_dim)
+
+            # Build compact bf16 cache: [n_active, 2, bs, kv_heads, head_dim]
+            kv_cache_bf16 = torch.stack([k_bf16, v_bf16], dim=1)
+
+            # Remap block_table to point into the compact cache
+            # Create reverse mapping: original_block_idx -> compact_idx
+            remap = torch.full((num_blocks,), -1, dtype=torch.int32,
+                               device=block_table.device)
+            compact_idx = torch.arange(n_active, dtype=torch.int32,
+                                       device=block_table.device)
+            remap[unique_blocks.long()] = compact_idx
+            block_table_remapped = remap[block_table.long()]
+
+            # Replace attn_metadata's block_table with remapped version
+            attn_metadata = attn_metadata._replace(block_table=block_table_remapped) \
+                if hasattr(attn_metadata, '_replace') else attn_metadata
+            if not hasattr(attn_metadata, '_replace'):
+                attn_metadata.block_table = block_table_remapped
+        else:
+            # No block_table (prefill only) — create empty bf16 cache
+            kv_cache_bf16 = torch.zeros(
+                (1, 2, block_size, num_kv_heads, head_dim),
+                dtype=torch.bfloat16, device=kv_cache.device,
+            )
 
         # Call the original forward with bf16 cache.
         # We need to temporarily pretend this isn't a quantized cache.
