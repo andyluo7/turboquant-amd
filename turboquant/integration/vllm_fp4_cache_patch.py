@@ -507,31 +507,26 @@ def _make_fp4_forward(orig_fn):
         scale_dim = head_dim // 32    # 4
         import torch
 
-        # ── DECODE: use FP4 PA v9i kernel (reads interleaved [68] directly) ──
+        # ── DECODE: use FP4 PA v9u unified kernel (single cache pointer) ──
         if has_decode and not has_prefill:
-            import ctypes, math
+            import ctypes
 
-            # Load interleaved kernel
-            if not hasattr(_fp4_forward, '_lib_i'):
+            # Load unified kernel (takes single [N,2,bs,kv_heads,68] tensor)
+            if not hasattr(_fp4_forward, '_lib_u'):
                 import os
                 so_path = os.environ.get('TQ_FP4_PA_SO', '/tmp/fp4_pa_v9.so')
-                # Try interleaved variant first
-                so_i = so_path.replace('.so', 'i.so')
-                if not os.path.exists(so_i):
-                    so_i = so_path.replace('v9.so', 'v9i.so')
-                _fp4_forward._lib_i = ctypes.CDLL(so_i)
-                logger.info("[TQ-FP4] Loaded interleaved PA kernel: %s", so_i)
-            lib = _fp4_forward._lib_i
+                so_u = so_path.replace('v9.so', 'v9u.so').replace('.so', '.so')
+                if 'v9u' not in so_u:
+                    so_u = so_path.replace('.so', 'u.so')
+                _fp4_forward._lib_u = ctypes.CDLL(so_u)
+                logger.info("[TQ-FP4] Loaded unified PA kernel: %s", so_u)
+            lib = _fp4_forward._lib_u
 
             batch = num_decode_tokens
-            num_heads = query.shape[1] if query.dim() == 3 else self.num_heads
+            num_heads_q = query.shape[1] if query.dim() == 3 else self.num_heads
 
-            # K/V cache views: kv_cache[:, 0] and kv_cache[:, 1]
-            # These are [num_blocks, block_size, num_kv_heads, 68] int8
-            # The kernel reads interleaved packed+scales directly
-            key_cache = kv_cache[:, 0].contiguous()  # contiguous on K/V split only
-            val_cache = kv_cache[:, 1].contiguous()
-
+            # Pass the ENTIRE kv_cache tensor — no slicing, no .contiguous()
+            # Kernel indexes K at dim1=0 and V at dim1=1 internally
             q = query[:batch].contiguous()
             bt = attn_metadata.block_table[:batch].contiguous().to(torch.int32)
             cl = attn_metadata.seq_lens[:batch].to(torch.int32).contiguous()
@@ -541,15 +536,14 @@ def _make_fp4_forward(orig_fn):
             nsplits = _get_optimal_splits(max_ctx)
             max_blks = bt.shape[1]
 
-            bufs = _ensure_pa_buffers(q.device, num_heads, head_dim, q.dtype)
+            bufs = _ensure_pa_buffers(q.device, num_heads_q, head_dim, q.dtype)
             fp4_out = bufs['output'][:batch]
 
             stream = torch.cuda.current_stream().cuda_stream
 
-            lib.launch_fp4_pa_v9i(
+            lib.launch_fp4_pa_v9u(
                 ctypes.c_void_p(q.data_ptr()),
-                ctypes.c_void_p(key_cache.data_ptr()),
-                ctypes.c_void_p(val_cache.data_ptr()),
+                ctypes.c_void_p(kv_cache.data_ptr()),  # unified cache!
                 ctypes.c_void_p(bt.data_ptr()),
                 ctypes.c_void_p(cl.data_ptr()),
                 ctypes.c_void_p(fp4_out.data_ptr()),
@@ -557,7 +551,7 @@ def _make_fp4_forward(orig_fn):
                 ctypes.c_void_p(bufs['wl'].data_ptr()),
                 ctypes.c_void_p(bufs['wa'].data_ptr()),
                 ctypes.c_int(batch),
-                ctypes.c_int(num_heads),
+                ctypes.c_int(num_heads_q),
                 ctypes.c_int(num_kv_heads),
                 ctypes.c_int(head_dim),
                 ctypes.c_int(block_size),
