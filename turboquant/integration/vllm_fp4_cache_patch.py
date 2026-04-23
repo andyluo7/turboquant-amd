@@ -507,42 +507,66 @@ def _make_fp4_forward(orig_fn):
         scale_dim = head_dim // 32    # 4
         import torch
 
-        # ── DECODE: use FP4 PA v9 kernel directly (no dequant!) ──
+        # ── DECODE: use FP4 PA v9i kernel (reads interleaved [68] directly) ──
         if has_decode and not has_prefill:
-            # Pure decode — use PA v9 kernel which reads FP4 natively
-            from turboquant.integration.tq_fp4_backend import fp4_paged_attention_v9
+            import ctypes, math
 
-            # Extract K/V cache and scales from the interleaved layout
-            # kv_cache: [num_blocks, 2, block_size, num_kv_heads, 68] int8
-            key_cache_fp4 = kv_cache[:, 0]  # [num_blocks, bs, kv_heads, 68]
-            val_cache_fp4 = kv_cache[:, 1]
+            # Load interleaved kernel
+            if not hasattr(_fp4_forward, '_lib_i'):
+                import os
+                so_path = os.environ.get('TQ_FP4_PA_SO', '/tmp/fp4_pa_v9.so')
+                # Try interleaved variant first
+                so_i = so_path.replace('.so', 'i.so')
+                if not os.path.exists(so_i):
+                    so_i = so_path.replace('v9.so', 'v9i.so')
+                _fp4_forward._lib_i = ctypes.CDLL(so_i)
+                logger.info("[TQ-FP4] Loaded interleaved PA kernel: %s", so_i)
+            lib = _fp4_forward._lib_i
 
-            # Split packed data and scales
-            k_cache = key_cache_fp4[..., :packed_dim].contiguous().view(torch.uint8)
-            v_cache_data = val_cache_fp4[..., :packed_dim].contiguous().view(torch.uint8)
-            k_scale = key_cache_fp4[..., packed_dim:packed_dim + scale_dim].contiguous().view(torch.uint8)
-            v_scale = val_cache_fp4[..., packed_dim:packed_dim + scale_dim].contiguous().view(torch.uint8)
-
-            # Query: vLLM gives [num_tokens, num_heads, head_dim]
-            # PA v9 expects [batch, num_heads, head_dim] (same for decode)
             batch = num_decode_tokens
-            q_for_kernel = query[:batch].contiguous()
+            num_heads = query.shape[1] if query.dim() == 3 else self.num_heads
 
-            block_table = attn_metadata.block_table[:batch].contiguous().to(torch.int32)
-            ctx_lens = attn_metadata.seq_lens[:batch].to(torch.int32).contiguous()
+            # K/V cache views: kv_cache[:, 0] and kv_cache[:, 1]
+            # These are [num_blocks, block_size, num_kv_heads, 68] int8
+            # The kernel reads interleaved packed+scales directly
+            key_cache = kv_cache[:, 0].contiguous()  # contiguous on K/V split only
+            val_cache = kv_cache[:, 1].contiguous()
 
-            fp4_out = fp4_paged_attention_v9(
-                query=q_for_kernel,
-                k_cache=k_cache,
-                v_cache=v_cache_data,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                block_tables=block_table,
-                context_lens=ctx_lens,
-                scale=self.scale,
+            q = query[:batch].contiguous()
+            bt = attn_metadata.block_table[:batch].contiguous().to(torch.int32)
+            cl = attn_metadata.seq_lens[:batch].to(torch.int32).contiguous()
+
+            max_ctx = cl.max().item()
+            from turboquant.integration.tq_fp4_backend import _get_optimal_splits, _ensure_pa_buffers
+            nsplits = _get_optimal_splits(max_ctx)
+            max_blks = bt.shape[1]
+
+            bufs = _ensure_pa_buffers(q.device, num_heads, head_dim, q.dtype)
+            fp4_out = bufs['output'][:batch]
+
+            stream = torch.cuda.current_stream().cuda_stream
+
+            lib.launch_fp4_pa_v9i(
+                ctypes.c_void_p(q.data_ptr()),
+                ctypes.c_void_p(key_cache.data_ptr()),
+                ctypes.c_void_p(val_cache.data_ptr()),
+                ctypes.c_void_p(bt.data_ptr()),
+                ctypes.c_void_p(cl.data_ptr()),
+                ctypes.c_void_p(fp4_out.data_ptr()),
+                ctypes.c_void_p(bufs['wm'].data_ptr()),
+                ctypes.c_void_p(bufs['wl'].data_ptr()),
+                ctypes.c_void_p(bufs['wa'].data_ptr()),
+                ctypes.c_int(batch),
+                ctypes.c_int(num_heads),
+                ctypes.c_int(num_kv_heads),
+                ctypes.c_int(head_dim),
+                ctypes.c_int(block_size),
+                ctypes.c_int(max_blks),
+                ctypes.c_float(self.scale),
+                ctypes.c_int(nsplits),
+                ctypes.c_void_p(stream),
             )
 
-            # Copy PA v9 output to vLLM output buffer
             output[:batch].copy_(fp4_out[:batch])
             return output
 
