@@ -527,13 +527,25 @@ def _make_fp4_forward(orig_fn):
 
             # Pass the ENTIRE kv_cache tensor — no slicing, no .contiguous()
             # Kernel indexes K at dim1=0 and V at dim1=1 internally
-            q = query[:batch].contiguous()
-            bt = attn_metadata.block_table[:batch].contiguous().to(torch.int32)
-            cl = attn_metadata.seq_lens[:batch].to(torch.int32).contiguous()
+            # Avoid unnecessary copies — only convert if needed
+            q = query[:batch]
+            if not q.is_contiguous():
+                q = q.contiguous()
+            bt = attn_metadata.block_table[:batch]
+            if bt.dtype != torch.int32:
+                bt = bt.to(torch.int32)
+            if not bt.is_contiguous():
+                bt = bt.contiguous()
+            cl = attn_metadata.seq_lens[:batch]
+            if cl.dtype != torch.int32:
+                cl = cl.to(torch.int32)
+            if not cl.is_contiguous():
+                cl = cl.contiguous()
 
-            max_ctx = cl.max().item()
-            from turboquant.integration.tq_fp4_backend import _get_optimal_splits, _ensure_pa_buffers
-            nsplits = _get_optimal_splits(max_ctx)
+            # Use fixed splits to avoid GPU→CPU sync from .max().item()
+            # 8 splits works well for all context lengths (v9 default)
+            from turboquant.integration.tq_fp4_backend import _ensure_pa_buffers
+            nsplits = 8
             max_blks = bt.shape[1]
 
             bufs = _ensure_pa_buffers(q.device, num_heads_q, head_dim, q.dtype)
