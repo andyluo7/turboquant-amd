@@ -554,25 +554,32 @@ def _make_fp4_forward(orig_fn):
 
         # Call the original forward with bf16 cache.
         # We need to temporarily pretend this isn't a quantized cache.
-        orig_kv_cache_dtype = self.kv_cache_dtype
-        orig_quant_mode = self._kv_quant_mode
-        orig_is_per_token = self._is_per_token_head_quant
+        # Temporarily override cache dtype so original forward treats
+        # our bf16 cache as unquantized. Guard attribute access since
+        # TritonAttentionImpl may not have all RocmAttentionImpl attrs.
+        saved = {}
+        for attr in ('kv_cache_dtype', '_kv_quant_mode', '_is_per_token_head_quant'):
+            if hasattr(self, attr):
+                saved[attr] = getattr(self, attr)
         try:
-            self.kv_cache_dtype = "auto"
-            # Reset quant mode to non-quantized so the original forward
-            # treats our bf16 cache as a plain cache.
-            from vllm.v1.kv_cache_interface import get_kv_quant_mode
-            self._kv_quant_mode = get_kv_quant_mode("auto")
-            self._is_per_token_head_quant = False
+            if hasattr(self, 'kv_cache_dtype'):
+                self.kv_cache_dtype = "auto"
+            if hasattr(self, '_kv_quant_mode'):
+                try:
+                    from vllm.v1.kv_cache_interface import get_kv_quant_mode
+                    self._kv_quant_mode = get_kv_quant_mode("auto")
+                except ImportError:
+                    pass
+            if hasattr(self, '_is_per_token_head_quant'):
+                self._is_per_token_head_quant = False
 
             result = orig_fn(
                 self, layer, query, key, value, kv_cache_bf16,
                 attn_metadata, output, output_scale, output_block_scale,
             )
         finally:
-            self.kv_cache_dtype = orig_kv_cache_dtype
-            self._kv_quant_mode = orig_quant_mode
-            self._is_per_token_head_quant = orig_is_per_token
+            for attr, val in saved.items():
+                setattr(self, attr, val)
 
         return result
 
