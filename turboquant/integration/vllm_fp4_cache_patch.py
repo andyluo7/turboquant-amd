@@ -415,7 +415,7 @@ def apply_fp4_cache_patch() -> bool:
 
     # Also patch RocmAttnBackend (used when VLLM_ROCM_USE_AITER=0)
     try:
-        from vllm.v1.attention.backends.rocm_attn import RocmAttnBackend
+        from vllm.v1.attention.backends.rocm_attn import RocmAttentionBackend as RocmAttnBackend
         _originals["RocmAttnBackend.get_kv_cache_shape"] = (
             RocmAttnBackend.get_kv_cache_shape
         )
