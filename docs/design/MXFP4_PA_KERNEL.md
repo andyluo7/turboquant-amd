@@ -1,14 +1,15 @@
-# MXFP4 Paged Attention Kernel — Native FP4 MFMA on MI355X (gfx950)
+# FP4 Paged Attention Kernel — Native FP4 MFMA on gfx950
 
 ## Goal
-AITER PA kernel with FP4 KV cache storage, achieving ≤ FP8 latency with **2x KV cache capacity**.
+AITER paged-attention kernel with FP4 KV-cache storage, achieving ≤ FP8 latency
+with **2× KV cache capacity**.
 
 ## Key Instruction
 ```cpp
 __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
-    int32x8_t a,     // 32 bytes: Q data (padded to 256 bits)
-    int32x8_t b,     // 32 bytes: K data (padded to 256 bits)
-    float4_t c,      // accumulator
+    int32x8_t a,     // 32 bytes: A operand
+    int32x8_t b,     // 32 bytes: B operand (FP4 lives in low 16 bytes)
+    float4_t  c,     // accumulator
     cbsz,            // A format: 0=FP8_E4M3, 1=FP8_E5M2, 2=FP6_E2M3, 3=FP6_E3M2, 4=FP4_E2M1
     blgp,            // B format: same encoding
     opselA, scale_a, // E8M0 scale for A
@@ -16,119 +17,66 @@ __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
 );
 ```
 
-Found in CK: `ck_tile/ops/gemm/warp/warp_gemm_attribute_mfma_impl.hpp`
-
-### Data Types (from CK dtype2conf)
-| Type | cbsz/blgp | Vector Type | Size |
-|------|-----------|-------------|------|
-| FP8 E4M3 | 0 | int32x8_t (32B) | 32 values |
-| FP8 E5M2 | 1 | int32x8_t (32B) | 32 values |
-| FP6 E2M3 | 2 | pk_fp6x32_t (24B) | 32 values |
-| FP6 E3M2 | 3 | int32x6_t (24B) | 32 values |
-| **FP4 E2M1** | **4** | **int32x4_t (16B)** | **32 values** |
-
 ### Per-MFMA Call
-- Each call processes **32 elements** per operand
-- FP4: 32 values = 16 bytes of packed data
-- For HEAD_SIZE=128: **128/32 = 4 MFMA calls** (same as FP8)
-- FP4 operand is `int32x4_t` (16 bytes), padded to `int32x8_t` (32 bytes) via `arg256()`
+- Each call processes **32 elements** per operand (A and B).
+- FP4: 32 values = 16 bytes packed.
+- For HEAD_SIZE=128: 128/32 = **4 calls per QK head** (same as FP8).
 
 ## Storage Layout
 
-### KV Cache
-- Shape: `[num_blocks, block_size, num_kv_heads, 64]` uint8
-- 128 FP4 nibbles packed into 64 bytes per position per head
-- **Exactly 2x FP8 capacity** (FP8 uses 128 bytes per head)
+### KV cache
+- Shape: `[num_blocks, num_kv_heads, block_size, 64]` uint8 (HND).
+- 128 FP4 nibbles packed into 64 bytes per (position, head) → **2× FP8 capacity**.
 
-### Scale Tensor (separate)
-- Shape: `[num_blocks, block_size, num_kv_heads]` uint8
-- 1 E8M0 byte per position per head
-- Overhead: ~0.8% of cache size (negligible)
-- Passed to kernel as extra pointer argument
-
-## K/V Fetch
-```cpp
-// Load 16 packed FP4 bytes (32 nibbles = 32 FP4 values)
-const uint8_t* k_fp4 = reinterpret_cast<const uint8_t*>(k_ptr) + byte_offset;
-int32x4_t k_packed = *reinterpret_cast<const int32x4_t*>(k_fp4);
-// Pad to int32x8_t for MFMA
-int32x8_t k_arg = {k_packed[0], k_packed[1], k_packed[2], k_packed[3], 0, 0, 0, 0};
-```
+### Scale tensor (separate)
+- Shape: `[num_blocks, block_size, num_kv_heads]` uint8 — one E8M0 byte per
+  (position, head). Overhead ≈ 0.8% of cache size.
 
 ## Q Handling
-Two options:
-1. **Mixed FP8×FP4**: Q stays FP8 (cbsz=0), K is FP4 (blgp=4). Q conversion: bf16→FP8 (standard).
-2. **Full FP4×FP4**: Both Q and K in FP4 (cbsz=4, blgp=4). Q conversion: bf16→FP4 (more quantization loss).
-
-**Recommendation: Option 1 (mixed FP8×FP4)** — preserves Q precision, K is the compressed cache.
-
-## Scale Passing
-```cpp
-// Read E8M0 scale byte from separate scale tensor
-const uint8_t* k_scale_tensor = ...; // passed as kernel arg
-uint8_t e8m0 = k_scale_tensor[block_idx * block_size * num_kv_heads + seq_offset * num_kv_heads + head_idx];
-int32_t scale_b = (int32_t)e8m0;
-int32_t scale_a = 127; // Q scale = 1.0 (FP8 data, no additional scaling)
-```
+Mixed FP8 × FP4: Q is the A operand (FP8 E4M3, `cbsz=0`), K is the B operand
+(FP4 E2M1, `blgp=4`). Q stays in FP8 to preserve precision; K is the
+compressed cache.
 
 ## MFMA Integration
 ```cpp
-// QK dot product: 4 MFMA calls for HEAD_SIZE=128
-for (int i = 0; i < 4; i++) {
-    int32x4_t k_packed = load_16_bytes(k_fp4 + i * 16);
-    int32x8_t k_arg = arg256(k_packed);
-    int32x8_t q_arg = ...; // Q in FP8 format
-    
-    acc = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
-        q_arg, k_arg, acc,
-        0,  // cbsz=0: Q is FP8 E4M3
-        4,  // blgp=4: K is FP4 E2M1
-        0, scale_a,  // Q scale (127 = 1.0)
-        0, scale_b   // K scale (from E8M0 tensor)
-    );
-}
+// QK dot product, 4 calls per HEAD_SIZE=128 head.
+acc = __builtin_amdgcn_mfma_scale_f32_16x16x128_f8f6f4(
+    q_arg, k_arg, acc,
+    /*cbsz=*/0,   /*blgp=*/4,
+    /*opselA=*/0, /*scale_a=*/127,   // 127 = E8M0 0x7F = 1.0
+    /*opselB=*/0, /*scale_b=*/127);
 ```
 
-## Performance Analysis
+## Implementation in this repo
 
-| Metric | FP8 PA | FP4 PA (this plan) | Improvement |
-|--------|--------|-------------------|-------------|
-| K/V data per head | 128 bytes | 64 bytes | **2x less HBM** |
-| MFMA calls per head (QK) | 4 (16x16x32) | 4 (16x16x128) | same |
-| MFMA calls per head (V) | 4 | 4 | same |
-| KV cache capacity | 1x | **2x** | **2x** |
-| HBM bandwidth | 1x | ~0.5x | **~2x** |
-| Expected latency | 48μs | **≤48μs** | **≤1x** |
+The production path lives in
+`turboquant/integration/aiter/pa_kernels_fp4.cuh`, applied to AITER via
+`turboquant/integration/aiter/paged_attention_fp4_patch.py`.
 
-Decode is memory-bound → 2x less data load ≈ up to 2x faster.
+The forked kernel `_paged_attention_fp4_kernel` is templated on
+`bool USE_NATIVE_FP4_MFMA`; the dispatcher in `pa_v1.cuh` instantiates both
+specializations and selects between them at launch time. The forked path
+avoids the `if constexpr` codegen issue observed inside template kernels on
+ROCm 7.2.x — each specialization is a fully separate compile target and the
+unused branch in either is folded out by the optimizer.
 
-## Implementation Steps
+Two QK paths share the same Q build (FP8 INTERLEAVED), V-fetch (FP4→FP8 LUT
+decode), softmax, V-MFMA, and reduction:
 
-### Day 1: Kernel Fork + K/V Fetch
-1. Fork `_paged_attention_kernel` → `_paged_attention_mxfp4_kernel`
-2. Change cache_t to uint8_t, keep HEAD_SIZE=128
-3. Replace K fetch: load 16B packed FP4 → `int32x4_t` → pad to `int32x8_t`
-4. Replace V fetch: same pattern
-5. Add scale tensor pointer as extra kernel arg (via JIT template)
+- **Native** — K loaded as raw FP4 bytes; one
+  `mfma_scale_f32_16x16x128_f8f6f4` per head with `cbsz=0/blgp=4`. Output is
+  reoriented from `[M=qhead, N=token]` to AITER's `[M=token, N=qhead]` via a
+  4-lane `__shfl`.
+- **LUT** — FP4 nibbles decoded to FP8 E4M3 at K-fetch using a 16-entry
+  compile-time LUT, then `mfma_scale_f32_16x16x128_f8f6f4` with
+  `cbsz=0/blgp=0` (both operands FP8). No shuffle.
 
-### Day 2: MFMA + Q Conversion + Correctness
-6. Replace QK MFMA: `gcn_mfma16x16x32_instr` → `mfma_scale_f32_16x16x128_f8f6f4`
-7. Replace V accumulate MFMA: same instruction
-8. Q conversion: bf16 → FP8 E4M3 (for mixed mode)
-9. Scale: read from separate tensor, pass as scale_b
-10. Correctness test: compare vs SDPA reference (target cos > 0.99)
-
-### Day 3: vLLM Integration + E2E
-11. Register MXFP4 backend in vLLM
-12. MXFP4 compress_and_scatter (per_1x32_f4_quant → 64B cache + scale tensor)
-13. CUDAGraph compatibility (pre-allocated buffers)
-14. E2E serving test with MiniMax-M2.5 TP=2
-
-## Key Findings (2026-04-07)
-- `__hip_cvt_fp4x2_to_halfraw2` is **BROKEN** on gfx950 (returns zeros)
-- `__builtin_amdgcn_cvt_scalef32_pk_f16_fp4` **WORKS** for FP4→FP16 conversion
-- Single per-position E8M0 scale matches per-32 block scale quality (gap < 0.001 cosine)
-- Non-contiguous cache view causes memory faults → use `[2, nb, bs, nkv, D]` layout
-- CUDAGraph: pre-allocate all buffers, cap workspace to 128 partitions
-- Patching existing kernel MFMA tiling is intractable (QK_SIZE_RATIO derived from sizeof(cache_t))
-- **Native FP4 MFMA is the correct approach** — avoids all conversion/tiling issues
+## Notes
+- `__hip_cvt_fp4x2_to_halfraw2` returns zeros on ROCm 7.0.0 (gfx950); the
+  byte-LUT decode path avoids it.
+- The "MFMA returns zeros" report was caused by passing
+  `scale_a = scale_b = 0` (E8M0 0x00 = 2^-127 ≈ 0). Pass 127 (= 0x7F = 1.0)
+  for unscaled operands.
+- Patching the existing `_paged_attention_kernel` template in place is
+  intractable because `QK_SIZE_RATIO` is derived from `sizeof(cache_t)`; the
+  forked kernel sidesteps this.

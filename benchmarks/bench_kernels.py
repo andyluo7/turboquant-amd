@@ -534,7 +534,138 @@ def run():
             print(f"{BH:>4} {Sk:>6} | {pack_comp_ms:>9.3f}ms {pack_attn_ms:>9.3f}ms {pack_total:>9.3f}ms | "
                   f"{ref_comp_ms:>9.3f}ms {ref_attn_ms:>9.3f}ms {ref_total:>9.3f}ms | {e2e_sp:>8.2f}x  {attn_sp:>8.2f}x")
 
+    # ====== FP4 PAGED ATTENTION ======
+    try:
+        import aiter
+        from turboquant.integration.aiter.paged_attention_fp4_patch import apply
+        apply()
+
+        head_size  = D        # 128
+        block_size = 16
+        configs = [
+            # (num_seqs, seq_len, num_heads, num_kv_heads)
+            (1,   4096,  8,  8),
+            (4,   4096, 32,  8),
+            (1,  16384,  8,  8),
+            (4,  16384, 32,  8),
+            (1,  65536,  8,  8),
+            (4,  65536, 32,  8),
+        ]
+        print()
+        print("=" * 80)
+        print("FP4 Paged Attention Benchmark — AITER FP4 E2M1 (native MFMA) vs FP8 E4M3")
+        print("=" * 80)
+        print(f"{'seqs':>4} {'seq_len':>7} {'heads':>5} {'kv_h':>4} | "
+              f"{'fp4_ms':>8} {'fp8_ms':>8} | {'speedup':>7} | note")
+        print("-" * 72)
+        for num_seqs, seq_len, num_heads, num_kv_heads in configs:
+            scale = 1.0 / math.sqrt(head_size)
+            torch.manual_seed(42)
+            q = torch.randn(num_seqs, num_heads, head_size, dtype=torch.float16, device=device)
+            key_cache_fp4, value_cache_fp4, block_tables, context_lens = \
+                _make_fp4_paged_kv(num_seqs, seq_len, num_kv_heads, head_size, block_size, device)
+            num_blocks = key_cache_fp4.shape[0]
+            key_cache_fp8   = torch.zeros(num_blocks, num_kv_heads, block_size, head_size,
+                                          dtype=torch.uint8, device=device)
+            value_cache_fp8 = torch.zeros(num_blocks, num_kv_heads, block_size, head_size,
+                                          dtype=torch.uint8, device=device)
+            max_num_partitions = math.ceil(seq_len / 256)
+            ws_elems = max(
+                num_seqs * num_heads * max_num_partitions * 2
+                + num_seqs * num_heads * max_num_partitions * head_size // 2,
+                256,
+            )
+            k_scale = torch.tensor([1.0], dtype=torch.float32, device=device)
+            v_scale = torch.tensor([1.0], dtype=torch.float32, device=device)
+
+            def _run(key_cache, value_cache, dtype_str):
+                out = torch.zeros(num_seqs, num_heads, head_size, dtype=torch.float16, device=device)
+                ws  = torch.zeros(ws_elems, dtype=torch.float32, device=device)
+                aiter.paged_attention_v1(
+                    out, ws, q, key_cache, value_cache,
+                    scale, block_tables, None, context_lens, seq_len,
+                    None, dtype_str, "HND", 0.0, k_scale, v_scale,
+                )
+                return out
+
+            for _ in range(10):
+                _run(key_cache_fp4, value_cache_fp4, "fp4_e2m1")
+                _run(key_cache_fp8, value_cache_fp8, "fp8_e4m3")
+            torch.cuda.synchronize()
+
+            t0 = time.perf_counter()
+            for _ in range(100): _run(key_cache_fp4, value_cache_fp4, "fp4_e2m1")
+            torch.cuda.synchronize()
+            fp4_ms = (time.perf_counter() - t0) / 100 * 1000
+
+            t0 = time.perf_counter()
+            for _ in range(100): _run(key_cache_fp8, value_cache_fp8, "fp8_e4m3")
+            torch.cuda.synchronize()
+            fp8_ms = (time.perf_counter() - t0) / 100 * 1000
+
+            speedup = fp8_ms / fp4_ms if fp4_ms > 0 else float("inf")
+            print(f"{num_seqs:>4} {seq_len:>7} {num_heads:>5} {num_kv_heads:>4} | "
+                  f"{fp4_ms:>7.3f}ms {fp8_ms:>7.3f}ms | {speedup:>6.2f}x  | 2x KV mem")
+        print()
+    except Exception as e:
+        print(f"\n[FP4 PA bench] Skipped — {e}")
+
     print("\nDone!")
+
+
+def _make_fp4_paged_kv(num_seqs, seq_len, num_kv_heads, head_size, block_size, device):
+    """Build paged KV caches in FP4 E2M1 nibble-packed format (HND layout)."""
+    import numpy as np
+
+    FP4_REP = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+
+    def _nibble(v):
+        sign = 0
+        if v < 0:
+            sign = 8; v = -v
+        v = min(v, 6.0)
+        best = min(range(8), key=lambda i: abs(v - FP4_REP[i]))
+        return best | sign
+
+    def _pack(t):
+        flat = t.cpu().float().numpy().flatten()
+        buf = bytearray(len(flat) // 2)
+        for i in range(0, len(flat), 2):
+            buf[i // 2] = _nibble(flat[i]) | (_nibble(flat[i + 1]) << 4)
+        return torch.from_numpy(np.frombuffer(buf, dtype=np.uint8).copy())
+
+    import math
+    num_blocks_per_seq = math.ceil(seq_len / block_size)
+    total_blocks = num_seqs * num_blocks_per_seq
+    fp4_bytes = head_size // 2
+
+    torch.manual_seed(0)
+    k_ref = torch.randn(num_seqs, seq_len, num_kv_heads, head_size).clamp(-5.9, 5.9)
+    v_ref = torch.randn(num_seqs, seq_len, num_kv_heads, head_size).clamp(-5.9, 5.9)
+
+    key_cache   = torch.zeros(total_blocks, num_kv_heads, block_size, fp4_bytes, dtype=torch.uint8)
+    value_cache = torch.zeros(total_blocks, num_kv_heads, block_size, fp4_bytes, dtype=torch.uint8)
+    block_tables = torch.zeros(num_seqs, num_blocks_per_seq, dtype=torch.int32)
+
+    block_id = 0
+    for seq_id in range(num_seqs):
+        for blk in range(num_blocks_per_seq):
+            block_tables[seq_id, blk] = block_id
+            for slot in range(block_size):
+                tok = blk * block_size + slot
+                if tok >= seq_len:
+                    break
+                for h in range(num_kv_heads):
+                    key_cache[block_id, h, slot]   = _pack(k_ref[seq_id, tok, h])
+                    value_cache[block_id, h, slot] = _pack(v_ref[seq_id, tok, h])
+            block_id += 1
+
+    context_lens = torch.full((num_seqs,), seq_len, dtype=torch.int32)
+    return (
+        key_cache.to(device), value_cache.to(device),
+        block_tables.to(device), context_lens.to(device),
+    )
+
 
 if __name__ == "__main__":
     run()
