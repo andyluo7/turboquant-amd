@@ -320,10 +320,12 @@ def quantize_fp4_e2m1(x_bf16):
 
     # FP4 E2M1 magnitude encoding:
     # 0=0.0, 1=0.5, 2=1.0, 3=1.5, 4=2.0, 5=3.0, 6=4.0, 7=6.0
-    fp4_lut = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
-        device=x.device, dtype=torch.float32,
-    )
+    if not hasattr(quantize_fp4_e2m1, '_lut') or quantize_fp4_e2m1._lut.device != x.device:
+        quantize_fp4_e2m1._lut = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+            device=x.device, dtype=torch.float32,
+        )
+    fp4_lut = quantize_fp4_e2m1._lut
     # Find nearest representable magnitude
     diffs = (abs_val.unsqueeze(-1) - fp4_lut).abs()  # [..., G, 32, 8]
     mag_idx = diffs.argmin(dim=-1).to(torch.uint8)   # 3 bits
@@ -351,10 +353,12 @@ def dequantize_fp4_e2m1(packed, scales, head_dim=128):
     """
     import torch
 
-    fp4_lut = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
-        device=packed.device, dtype=torch.float32,
-    )
+    if not hasattr(dequantize_fp4_e2m1, '_lut') or dequantize_fp4_e2m1._lut.device != packed.device:
+        dequantize_fp4_e2m1._lut = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+            device=packed.device, dtype=torch.float32,
+        )
+    fp4_lut = dequantize_fp4_e2m1._lut
 
     # Unpack nibbles
     low = (packed & 0x0F).to(torch.int32)         # even indices
@@ -440,15 +444,14 @@ def _make_fp4_do_kv_cache_update(orig_fn):
 
         # Scatter-write into cache using slot_mapping
         # slot_mapping[i] maps token i → (block_idx * block_size + block_offset)
-        valid_mask = slot_mapping >= 0
-        valid_slots = slot_mapping[valid_mask]
-        block_indices = valid_slots // block_size
-        block_offsets = valid_slots % block_size
+        # Clamp negative slots to 0 to avoid boolean masking (not graph-safe)
+        safe_slots = slot_mapping.clamp(min=0)
+        block_indices = (safe_slots // block_size).long()
+        block_offsets = (safe_slots % block_size).long()
 
-        # Write K: key_cache[block_idx, block_offset, :, :] = k_fp4[token]
-        key_cache[block_indices, block_offsets] = k_fp4[valid_mask]
-        # Write V: value_cache[block_idx, block_offset, :, :] = v_fp4[token]
-        value_cache[block_indices, block_offsets] = v_fp4[valid_mask]
+        # Write K and V (invalid slots write to block 0 which is harmless)
+        key_cache[block_indices, block_offsets] = k_fp4
+        value_cache[block_indices, block_offsets] = v_fp4
 
     return _fp4_do_kv_cache_update
 
