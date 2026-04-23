@@ -426,10 +426,11 @@ def _make_fp4_do_kv_cache_update(orig_fn):
         scale_dim = head_dim // 32   # 4
         block_size = key_cache.shape[1]
 
-        # Quantize K and V to FP4
-        # key:   [num_tokens, num_kv_heads, head_dim] → packed [N, H, 64], scales [N, H, 4]
-        k_packed, k_scales = quantize_fp4_e2m1(key)
-        v_packed, v_scales = quantize_fp4_e2m1(value)
+        # Quantize K and V to FP4 using TurboQuant compress
+        # (proper E8M0 scaling with max/6.0 normalization + searchsorted)
+        from turboquant.integration.tq_fp4_backend import turbo4_compress_to_fp4
+        k_packed, k_scales = turbo4_compress_to_fp4(key)
+        v_packed, v_scales = turbo4_compress_to_fp4(value)
 
         # Concatenate packed data and scales along last dim → [N, H, 68]
         k_fp4 = torch.cat([
