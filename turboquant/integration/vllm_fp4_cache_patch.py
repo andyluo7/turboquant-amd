@@ -594,14 +594,46 @@ def _make_fp4_forward(orig_fn):
             output[:batch].copy_(fp4_out[:batch])
             return output
 
-        # ── PREFILL or MIXED: fall through to original with standard cache ──
-        # For prefill, the fresh K/V are bf16 and get written to cache
-        # by do_kv_cache_update. The prefill attention uses fresh K/V
-        # directly (not from cache), so int8 cache dtype doesn't matter.
-        return orig_fn(
-            self, layer, query, key, value, kv_cache,
-            attn_metadata, output, output_scale, output_block_scale,
-        )
+        # ── PREFILL or MIXED: use SDPA on fresh K/V (don't read from FP4 cache) ──
+        # The original forward would try to read int8 FP4 cache as bf16 = garbage.
+        # For prefill, all K/V are fresh (provided as arguments), so we compute
+        # attention directly using PyTorch scaled_dot_product_attention.
+        import torch.nn.functional as F
+
+        # GQA: expand K/V heads to match Q heads
+        # query: [N, num_q_heads, D], key/value: [N, num_kv_heads, D]
+        n_tokens = query.shape[0]
+        n_q_heads = query.shape[1] if query.dim() == 3 else self.num_heads
+
+        if key is not None and key.shape[0] > 0:
+            gqa_ratio = n_q_heads // num_kv_heads
+            if gqa_ratio > 1:
+                # Expand KV heads for GQA
+                key_exp = key.unsqueeze(2).expand(-1, -1, gqa_ratio, -1).reshape(n_tokens, n_q_heads, head_dim)
+                value_exp = value.unsqueeze(2).expand(-1, -1, gqa_ratio, -1).reshape(n_tokens, n_q_heads, head_dim)
+            else:
+                key_exp = key
+                value_exp = value
+
+            # SDPA expects [batch, heads, seq_len, head_dim] but we have [seq_len, heads, dim]
+            # For prefill with single sequence, treat all tokens as one sequence
+            q_sdpa = query.unsqueeze(0).transpose(1, 2)   # [1, heads, N, D]
+            k_sdpa = key_exp.unsqueeze(0).transpose(1, 2)  # [1, heads, N, D]
+            v_sdpa = value_exp.unsqueeze(0).transpose(1, 2)
+
+            # Causal attention
+            out_sdpa = F.scaled_dot_product_attention(
+                q_sdpa, k_sdpa, v_sdpa,
+                is_causal=True,
+                scale=self.scale,
+            )  # [1, heads, N, D]
+
+            out_flat = out_sdpa.squeeze(0).transpose(0, 1)  # [N, heads, D]
+            output[:n_tokens].copy_(out_flat)
+        else:
+            output.fill_(0)
+
+        return output
 
     return _fp4_forward
 
