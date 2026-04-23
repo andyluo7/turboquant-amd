@@ -484,13 +484,12 @@ def apply_fp4_cache_patch() -> bool:
                             kv_cache_spec.block_size // kernel_block_size
                         )
                         kernel_num_blocks = num_blocks * num_blocks_per_kv_block
-                        kv_cache_shape = attn_backend.get_kv_cache_shape(
-                            kernel_num_blocks,
-                            kernel_block_size,
-                            kv_cache_spec.num_kv_heads,
-                            kv_cache_spec.head_size,
-                            cache_dtype_str=self.cache_config.cache_dtype,
-                        )
+                        # Compute FP4 shape directly — don't rely on
+                        # attn_backend.get_kv_cache_shape which may not
+                        # be patched if the class ref was captured early.
+                        fp4_dim = kv_cache_spec.head_size // 2 + kv_cache_spec.head_size // 32
+                        kv_cache_shape = (2, kernel_num_blocks, kernel_block_size,
+                                          kv_cache_spec.num_kv_heads, fp4_dim)
                         try:
                             kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
                             assert len(kv_cache_stride_order) == len(kv_cache_shape)
