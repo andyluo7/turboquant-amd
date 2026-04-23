@@ -121,7 +121,8 @@ def turbo4_compress_to_fp4(
 
     # E8M0 exponent: e = floor(log2(max / 6.0))  where 6.0 is max FP4 value
     # scale = 2^e,  stored as (e + 127) in uint8
-    e = torch.floor(torch.log2(group_max / 6.0)).clamp(-127, 127)
+    # Use ceil so that max / 2^e <= 6.0 (fits in FP4 range)
+    e = torch.ceil(torch.log2(group_max / 6.0)).clamp(-127, 127)
     scale_float = torch.pow(2.0, e)                        # [T, H, G, 1]
     scale_e8m0 = (e + E8M0_BIAS).to(torch.uint8).squeeze(-1)  # [T, H, G]
 
