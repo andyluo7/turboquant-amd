@@ -256,9 +256,9 @@ def fp4_get_kv_cache_shape(
 ) -> tuple[int, ...]:
     """KV cache shape for FP4 packing.
 
-    Shape: (2, num_blocks, block_size, num_kv_heads, fp4_bytes_per_head)
+    Shape: (num_blocks, 2, block_size, num_kv_heads, fp4_bytes_per_head)
     where:
-      - 2 = K and V caches stacked
+      - 2 = K and V caches (at dim 1, matching vLLM's unbind(1) convention)
       - fp4_bytes_per_head = head_size//2 + head_size//32
                            = 64 + 4 = 68 for head_size=128
 
@@ -270,7 +270,7 @@ def fp4_get_kv_cache_shape(
     if block_size % 16 != 0:
         raise ValueError("Block size must be a multiple of 16.")
     fp4_bytes = fp4_bytes_per_head(head_size)
-    return (2, num_blocks, block_size, num_kv_heads, fp4_bytes)
+    return (num_blocks, 2, block_size, num_kv_heads, fp4_bytes)
 
 
 # ============================================================================
@@ -487,8 +487,10 @@ def apply_fp4_cache_patch() -> bool:
                         # Compute FP4 shape directly — don't rely on
                         # attn_backend.get_kv_cache_shape which may not
                         # be patched if the class ref was captured early.
+                        # Use standard vLLM dim order: (num_blocks, 2, block_size, kv_heads, dim)
+                        # so that kv_cache.unbind(1) gives (K, V) as expected.
                         fp4_dim = kv_cache_spec.head_size // 2 + kv_cache_spec.head_size // 32
-                        kv_cache_shape = (2, kernel_num_blocks, kernel_block_size,
+                        kv_cache_shape = (kernel_num_blocks, 2, kernel_block_size,
                                           kv_cache_spec.num_kv_heads, fp4_dim)
                         try:
                             kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()

@@ -712,8 +712,10 @@ def _make_fp4_backend_classes():
             if block_size % 16 != 0:
                 raise ValueError("Block size must be a multiple of 16.")
             # FP4 packed data + inline E8M0 scales
+            # Use standard vLLM dim order: (num_blocks, 2, block_size, kv_heads, dim)
+            # so that kv_cache.unbind(1) gives (K, V) as expected.
             fp4_dim = head_size // 2 + head_size // 32  # 64+4=68 for head_size=128
-            return (2, num_blocks, block_size, num_kv_heads, fp4_dim)
+            return (num_blocks, 2, block_size, num_kv_heads, fp4_dim)
 
         @classmethod
         def supports_compute_capability(
