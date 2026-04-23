@@ -500,6 +500,19 @@ def _make_fp4_forward(orig_fn):
         has_decode = num_decode_tokens > 0
         has_prefill = query.shape[0] > num_decode_tokens
 
+        # Extended diagnostic (first 5 calls)
+        if not hasattr(_fp4_forward, '_call_count'):
+            _fp4_forward._call_count = 0
+        _fp4_forward._call_count += 1
+        if _fp4_forward._call_count <= 5:
+            import sys
+            print(f"[TQ-FWD #{_fp4_forward._call_count}] query={query.shape} "
+                  f"num_decode={num_decode_tokens} has_decode={has_decode} "
+                  f"has_prefill={has_prefill} "
+                  f"block_table={getattr(attn_metadata, 'block_table', None) is not None and attn_metadata.block_table.shape} "
+                  f"seq_lens={getattr(attn_metadata, 'seq_lens', None) is not None and attn_metadata.seq_lens[:min(3, attn_metadata.seq_lens.shape[0])].tolist()}",
+                  file=sys.stderr, flush=True)
+
         # kv_cache: [num_blocks, 2, block_size, num_kv_heads, 68] int8
         num_blocks = kv_cache.shape[0]
         block_size = kv_cache.shape[2]
