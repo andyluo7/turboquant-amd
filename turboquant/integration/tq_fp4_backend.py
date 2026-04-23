@@ -129,7 +129,10 @@ def turbo4_compress_to_fp4(
     x_scaled = x_groups / scale_float                      # [T, H, G, 32]
 
     # Quantize each element to nearest FP4 E2M1 index (0-15)
-    boundaries_t = torch.tensor(FP4_BOUNDARIES, device=x.device, dtype=torch.float32)
+    # Cache boundaries tensor to avoid allocation during graph capture
+    if not hasattr(turbo4_compress_to_fp4, '_boundaries') or turbo4_compress_to_fp4._boundaries.device != x.device:
+        turbo4_compress_to_fp4._boundaries = torch.tensor(FP4_BOUNDARIES, device=x.device, dtype=torch.float32)
+    boundaries_t = turbo4_compress_to_fp4._boundaries
 
     x_flat = x_scaled.reshape(-1)
     sign = (x_flat < 0).long()          # 0 or 1
