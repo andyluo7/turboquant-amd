@@ -13,7 +13,10 @@ What gets patched:
   1. FullAttentionSpec.real_page_size_bytes → FP4-aware page size calculation
   2. AttentionSpec.real_page_size_bytes    → FP4-aware page size (base class)
   3. _reshape_kv_cache()                  → view as int8 (not model dtype) for FP4
-  4. Integration with TurboQuantFP4Backend.get_kv_cache_shape()
+  4. Backend get_kv_cache_shape()          → FP4 shape for AITER/ROCm/Triton backends
+  5. TritonAttentionBackend.get_kv_cache_shape() → FP4-compatible cache shape
+  6. TritonAttentionImpl.do_kv_cache_update()    → bf16→FP4 quantize + scatter
+  7. TritonAttentionImpl.forward()               → FP4→bf16 dequant before Triton kernel
 
 Activation:
   Set TQ_FP4_ENABLE=1 environment variable before launching vLLM.
@@ -274,6 +277,276 @@ def fp4_get_kv_cache_shape(
 
 
 # ============================================================================
+# FP4 E2M1 Quantization / Dequantization
+# ============================================================================
+
+def quantize_fp4_e2m1(x_bf16):
+    """Quantize bf16 to FP4 E2M1 packed uint8 + E8M0 scales.
+
+    Args:
+        x_bf16: [..., head_dim] bf16 tensor (head_dim=128)
+    Returns:
+        packed: [..., head_dim//2] uint8 (2 FP4 values per byte)
+        scales: [..., head_dim//32] uint8 (E8M0 per group of 32)
+    """
+    import torch
+
+    shape = x_bf16.shape
+    head_dim = shape[-1]  # 128
+    assert head_dim % 32 == 0, f"head_dim must be multiple of 32, got {head_dim}"
+
+    # Group into 32-element groups: [..., num_groups, 32]
+    num_groups = head_dim // 32
+    x = x_bf16.float().reshape(*shape[:-1], num_groups, 32)
+
+    # E8M0 scale per group: max abs value
+    group_max = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)  # [..., G, 1]
+
+    # E8M0 encoding: scale = 2^(e8m0 - 127)
+    # e8m0 = floor(log2(group_max)) + 127
+    e8m0 = torch.clamp(
+        torch.floor(torch.log2(group_max)) + 127,
+        0, 254
+    ).to(torch.uint8).squeeze(-1)  # [..., G]
+
+    scale_float = torch.pow(2.0, e8m0.float() - 127).unsqueeze(-1)  # [..., G, 1]
+
+    # Normalize and clamp to FP4 range [-6, 6]
+    x_scaled = (x / scale_float).clamp(-6.0, 6.0)
+
+    # Sign bit (MSB of nibble)
+    sign = (x_scaled < 0).to(torch.uint8)  # 1 bit
+    abs_val = x_scaled.abs()
+
+    # FP4 E2M1 magnitude encoding:
+    # 0=0.0, 1=0.5, 2=1.0, 3=1.5, 4=2.0, 5=3.0, 6=4.0, 7=6.0
+    fp4_lut = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        device=x.device, dtype=torch.float32,
+    )
+    # Find nearest representable magnitude
+    diffs = (abs_val.unsqueeze(-1) - fp4_lut).abs()  # [..., G, 32, 8]
+    mag_idx = diffs.argmin(dim=-1).to(torch.uint8)   # 3 bits
+
+    nibble = (sign << 3) | mag_idx  # 4 bits per value
+
+    # Pack pairs of nibbles into bytes: even→low, odd→high
+    nibble_flat = nibble.reshape(*shape[:-1], head_dim)
+    even = nibble_flat[..., 0::2]   # low nibble
+    odd = nibble_flat[..., 1::2]    # high nibble
+    packed = (odd << 4) | even       # [..., head_dim//2] uint8
+
+    return packed, e8m0
+
+
+def dequantize_fp4_e2m1(packed, scales, head_dim=128):
+    """Dequantize FP4 E2M1 packed uint8 + E8M0 scales to bf16.
+
+    Args:
+        packed: [..., head_dim//2] uint8
+        scales: [..., head_dim//32] uint8 (E8M0)
+        head_dim: original head dimension (default 128)
+    Returns:
+        x_bf16: [..., head_dim] bf16
+    """
+    import torch
+
+    fp4_lut = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        device=packed.device, dtype=torch.float32,
+    )
+
+    # Unpack nibbles
+    low = (packed & 0x0F).to(torch.int32)         # even indices
+    high = ((packed >> 4) & 0x0F).to(torch.int32)  # odd indices
+
+    # Interleave back: [low0, high0, low1, high1, ...]
+    shape = packed.shape
+    unpacked = torch.stack([low, high], dim=-1).reshape(*shape[:-1], head_dim)
+
+    sign = ((unpacked >> 3) & 1).float()   # 1 bit
+    mag_idx = (unpacked & 7).long()        # 3 bits
+
+    magnitude = fp4_lut[mag_idx]
+    values = magnitude * (1 - 2 * sign)    # apply sign
+
+    # Apply E8M0 scales per group of 32
+    num_groups = head_dim // 32
+    scale_float = torch.pow(2.0, scales.float() - 127)  # [..., G]
+    values_grouped = values.reshape(*shape[:-1], num_groups, 32)
+    values_grouped = values_grouped * scale_float.unsqueeze(-1)
+
+    return values_grouped.reshape(*shape[:-1], head_dim).to(torch.bfloat16)
+
+
+# ============================================================================
+# FP4 TritonAttentionImpl Patches
+# ============================================================================
+
+def _make_fp4_do_kv_cache_update(orig_fn):
+    """Create a patched do_kv_cache_update that compresses bf16 K/V → FP4.
+
+    Instead of calling triton_reshape_and_cache_flash (which expects matching
+    dtypes), we quantize the incoming bf16 K/V to FP4 E2M1 + E8M0 scales
+    and scatter-write them into the int8 KV cache using slot_mapping.
+
+    Cache layout per K or V:
+        [num_blocks, block_size, num_kv_heads, 68]
+        where 68 = 64 (packed FP4) + 4 (E8M0 scales) for head_dim=128.
+    """
+    import torch
+    from vllm.v1.attention.backend import AttentionType
+
+    def _fp4_do_kv_cache_update(
+        self,
+        layer,
+        key,        # [num_tokens, num_kv_heads, head_dim] bf16
+        value,      # [num_tokens, num_kv_heads, head_dim] bf16
+        kv_cache,   # [num_blocks, 2, block_size, num_kv_heads, 68] int8
+        slot_mapping,  # [num_tokens] int64
+    ):
+        if not is_fp4_enabled():
+            return orig_fn(self, layer, key, value, kv_cache, slot_mapping)
+
+        # Skip for encoder attention
+        if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
+            return
+
+        # kv_cache shape: [num_blocks, 2, block_size, num_kv_heads, fp4_dim]
+        # unbind(1) gives key_cache, value_cache each:
+        #   [num_blocks, block_size, num_kv_heads, fp4_dim]
+        key_cache, value_cache = kv_cache.unbind(1)
+
+        head_dim = key.shape[-1]  # 128
+        packed_dim = head_dim // 2   # 64
+        scale_dim = head_dim // 32   # 4
+        block_size = key_cache.shape[1]
+
+        # Quantize K and V to FP4
+        # key:   [num_tokens, num_kv_heads, head_dim] → packed [N, H, 64], scales [N, H, 4]
+        k_packed, k_scales = quantize_fp4_e2m1(key)
+        v_packed, v_scales = quantize_fp4_e2m1(value)
+
+        # Concatenate packed data and scales along last dim → [N, H, 68]
+        k_fp4 = torch.cat([
+            k_packed.view(torch.int8),
+            k_scales.view(torch.int8),
+        ], dim=-1)  # [num_tokens, num_kv_heads, 68]
+
+        v_fp4 = torch.cat([
+            v_packed.view(torch.int8),
+            v_scales.view(torch.int8),
+        ], dim=-1)  # [num_tokens, num_kv_heads, 68]
+
+        # Scatter-write into cache using slot_mapping
+        # slot_mapping[i] maps token i → (block_idx * block_size + block_offset)
+        valid_mask = slot_mapping >= 0
+        valid_slots = slot_mapping[valid_mask]
+        block_indices = valid_slots // block_size
+        block_offsets = valid_slots % block_size
+
+        # Write K: key_cache[block_idx, block_offset, :, :] = k_fp4[token]
+        key_cache[block_indices, block_offsets] = k_fp4[valid_mask]
+        # Write V: value_cache[block_idx, block_offset, :, :] = v_fp4[token]
+        value_cache[block_indices, block_offsets] = v_fp4[valid_mask]
+
+    return _fp4_do_kv_cache_update
+
+
+def _make_fp4_forward(orig_fn):
+    """Create a patched forward that dequantizes FP4 cache → bf16 for Triton.
+
+    Strategy:
+    - For decode (max_query_len == 1): dequantize FP4 cache blocks to bf16,
+      create temporary bf16 key/value cache tensors, call the original
+      forward which runs the standard Triton unified_attention kernel.
+    - For prefill (max_query_len > 1): fresh K/V are already bf16 and
+      the prefill path uses context_attention_fwd on Q/K/V directly
+      (no cache read), so we need to create a temporary bf16 cache for
+      the unified_attention call.
+
+    This is a correctness-first implementation. Performance optimization
+    (e.g., fused FP4 decode kernel) comes later.
+    """
+    import torch
+
+    def _fp4_forward(
+        self,
+        layer,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_metadata,
+        output,
+        output_scale=None,
+        output_block_scale=None,
+    ):
+        if not is_fp4_enabled():
+            return orig_fn(
+                self, layer, query, key, value, kv_cache,
+                attn_metadata, output, output_scale, output_block_scale,
+            )
+
+        if attn_metadata is None:
+            return output.fill_(0)
+
+        # kv_cache: [num_blocks, 2, block_size, num_kv_heads, 68] int8
+        num_blocks = kv_cache.shape[0]
+        block_size = kv_cache.shape[2]
+        num_kv_heads = kv_cache.shape[3]
+        fp4_dim = kv_cache.shape[4]  # 68
+        head_dim = self.head_size     # 128
+        packed_dim = head_dim // 2    # 64
+        scale_dim = head_dim // 32    # 4
+
+        # Dequantize the ENTIRE FP4 cache to bf16 temporary tensors.
+        # This is O(num_blocks * block_size) but correct.
+        # Cache layout: [num_blocks, 2, block_size, num_kv_heads, 68]
+        key_cache_fp4, value_cache_fp4 = kv_cache.unbind(1)
+        # Each: [num_blocks, block_size, num_kv_heads, 68] int8
+
+        # Extract packed data and scales
+        k_packed = key_cache_fp4[..., :packed_dim].view(torch.uint8)
+        k_scales = key_cache_fp4[..., packed_dim:packed_dim + scale_dim].view(torch.uint8)
+        v_packed = value_cache_fp4[..., :packed_dim].view(torch.uint8)
+        v_scales = value_cache_fp4[..., packed_dim:packed_dim + scale_dim].view(torch.uint8)
+
+        # Dequantize to bf16: [num_blocks, block_size, num_kv_heads, head_dim]
+        k_bf16 = dequantize_fp4_e2m1(k_packed, k_scales, head_dim)
+        v_bf16 = dequantize_fp4_e2m1(v_packed, v_scales, head_dim)
+
+        # Build temporary bf16 kv_cache: [num_blocks, 2, block_size, num_kv_heads, head_dim]
+        kv_cache_bf16 = torch.stack([k_bf16, v_bf16], dim=1)
+
+        # Call the original forward with bf16 cache.
+        # We need to temporarily pretend this isn't a quantized cache.
+        orig_kv_cache_dtype = self.kv_cache_dtype
+        orig_quant_mode = self._kv_quant_mode
+        orig_is_per_token = self._is_per_token_head_quant
+        try:
+            self.kv_cache_dtype = "auto"
+            # Reset quant mode to non-quantized so the original forward
+            # treats our bf16 cache as a plain cache.
+            from vllm.v1.kv_cache_interface import get_kv_quant_mode
+            self._kv_quant_mode = get_kv_quant_mode("auto")
+            self._is_per_token_head_quant = False
+
+            result = orig_fn(
+                self, layer, query, key, value, kv_cache_bf16,
+                attn_metadata, output, output_scale, output_block_scale,
+            )
+        finally:
+            self.kv_cache_dtype = orig_kv_cache_dtype
+            self._kv_quant_mode = orig_quant_mode
+            self._is_per_token_head_quant = orig_is_per_token
+
+        return result
+
+    return _fp4_forward
+
+
+# ============================================================================
 # Main Patch Application
 # ============================================================================
 
@@ -526,6 +799,85 @@ def apply_fp4_cache_patch() -> bool:
     except ImportError as e:
         logger.debug("[TQ-FP4] GPUModelRunner not available: %s", e)
 
+    # ── Patch 5: TritonAttentionBackend.get_kv_cache_shape ──
+    # When using Triton attention (VLLM_ROCM_USE_AITER=0), the Triton
+    # backend's get_kv_cache_shape must also return FP4-compatible shapes.
+    try:
+        from vllm.v1.attention.backends.triton_attn import (
+            TritonAttentionBackend,
+        )
+        _originals["TritonAttentionBackend.get_kv_cache_shape"] = (
+            TritonAttentionBackend.get_kv_cache_shape
+        )
+
+        @staticmethod
+        def _fp4_triton_get_kv_cache_shape(
+            num_blocks: int,
+            block_size: int,
+            num_kv_heads: int,
+            head_size: int,
+            cache_dtype_str: str = "auto",
+        ) -> tuple[int, ...]:
+            if is_fp4_enabled():
+                return fp4_get_kv_cache_shape(
+                    num_blocks, block_size, num_kv_heads, head_size,
+                    cache_dtype_str,
+                )
+            # Original Triton path
+            if block_size % 16 != 0:
+                raise ValueError("Block size must be a multiple of 16.")
+            return (num_blocks, 2, block_size, num_kv_heads, head_size)
+
+        TritonAttentionBackend.get_kv_cache_shape = _fp4_triton_get_kv_cache_shape
+        logger.info(
+            "[TQ-FP4] Patched TritonAttentionBackend.get_kv_cache_shape"
+        )
+    except ImportError:
+        logger.debug(
+            "[TQ-FP4] TritonAttentionBackend not available, "
+            "skipping get_kv_cache_shape patch"
+        )
+
+    # ── Patch 6: TritonAttentionImpl.do_kv_cache_update ──
+    # Replace the standard reshape_and_cache_flash call with FP4
+    # quantization + scatter-write into the int8 KV cache.
+    try:
+        from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
+
+        _originals["TritonAttentionImpl.do_kv_cache_update"] = (
+            TritonAttentionImpl.do_kv_cache_update
+        )
+        TritonAttentionImpl.do_kv_cache_update = _make_fp4_do_kv_cache_update(
+            TritonAttentionImpl.do_kv_cache_update
+        )
+        logger.info(
+            "[TQ-FP4] Patched TritonAttentionImpl.do_kv_cache_update"
+        )
+    except ImportError:
+        logger.debug(
+            "[TQ-FP4] TritonAttentionImpl not available, "
+            "skipping do_kv_cache_update patch"
+        )
+
+    # ── Patch 7: TritonAttentionImpl.forward ──
+    # Dequantize FP4 cache to bf16 temporary tensors before calling the
+    # standard Triton unified_attention kernel.
+    try:
+        from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
+
+        _originals["TritonAttentionImpl.forward"] = TritonAttentionImpl.forward
+        TritonAttentionImpl.forward = _make_fp4_forward(
+            TritonAttentionImpl.forward
+        )
+        logger.info(
+            "[TQ-FP4] Patched TritonAttentionImpl.forward"
+        )
+    except ImportError:
+        logger.debug(
+            "[TQ-FP4] TritonAttentionImpl not available, "
+            "skipping forward patch"
+        )
+
     _FP4_CACHE_PATCHED = True
 
     # Log summary
@@ -605,6 +957,34 @@ def revert_fp4_cache_patch() -> bool:
             if "AiterFlashAttentionBackend.get_kv_cache_shape" in _originals:
                 AiterFlashAttentionBackend.get_kv_cache_shape = _originals[
                     "AiterFlashAttentionBackend.get_kv_cache_shape"
+                ]
+        except ImportError:
+            pass
+
+        # Restore TritonAttentionBackend.get_kv_cache_shape
+        try:
+            from vllm.v1.attention.backends.triton_attn import (
+                TritonAttentionBackend,
+            )
+            if "TritonAttentionBackend.get_kv_cache_shape" in _originals:
+                TritonAttentionBackend.get_kv_cache_shape = _originals[
+                    "TritonAttentionBackend.get_kv_cache_shape"
+                ]
+        except ImportError:
+            pass
+
+        # Restore TritonAttentionImpl methods
+        try:
+            from vllm.v1.attention.backends.triton_attn import (
+                TritonAttentionImpl,
+            )
+            if "TritonAttentionImpl.do_kv_cache_update" in _originals:
+                TritonAttentionImpl.do_kv_cache_update = _originals[
+                    "TritonAttentionImpl.do_kv_cache_update"
+                ]
+            if "TritonAttentionImpl.forward" in _originals:
+                TritonAttentionImpl.forward = _originals[
+                    "TritonAttentionImpl.forward"
                 ]
         except ImportError:
             pass
@@ -763,6 +1143,41 @@ def verify_patch_integrity() -> dict[str, str]:
             results["AiterFlashAttentionBackend.get_kv_cache_shape"] = "ORIGINAL"
     except ImportError:
         results["AiterFlashAttentionBackend.get_kv_cache_shape"] = "UNAVAILABLE"
+
+    # Check 5: TritonAttentionBackend.get_kv_cache_shape
+    try:
+        from vllm.v1.attention.backends.triton_attn import (
+            TritonAttentionBackend,
+        )
+        fn = TritonAttentionBackend.get_kv_cache_shape
+        if "_fp4_triton_get_kv_cache_shape" in str(fn):
+            results["TritonAttentionBackend.get_kv_cache_shape"] = "PATCHED"
+        else:
+            results["TritonAttentionBackend.get_kv_cache_shape"] = "ORIGINAL"
+    except ImportError:
+        results["TritonAttentionBackend.get_kv_cache_shape"] = "UNAVAILABLE"
+
+    # Check 6: TritonAttentionImpl.do_kv_cache_update
+    try:
+        from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
+        fn = TritonAttentionImpl.do_kv_cache_update
+        if "_fp4_do_kv_cache_update" in str(fn):
+            results["TritonAttentionImpl.do_kv_cache_update"] = "PATCHED"
+        else:
+            results["TritonAttentionImpl.do_kv_cache_update"] = "ORIGINAL"
+    except ImportError:
+        results["TritonAttentionImpl.do_kv_cache_update"] = "UNAVAILABLE"
+
+    # Check 7: TritonAttentionImpl.forward
+    try:
+        from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
+        fn = TritonAttentionImpl.forward
+        if "_fp4_forward" in str(fn):
+            results["TritonAttentionImpl.forward"] = "PATCHED"
+        else:
+            results["TritonAttentionImpl.forward"] = "ORIGINAL"
+    except ImportError:
+        results["TritonAttentionImpl.forward"] = "UNAVAILABLE"
 
     results["TQ_FP4_ENABLE"] = "1" if is_fp4_enabled() else "0"
     results["_FP4_CACHE_PATCHED"] = str(_FP4_CACHE_PATCHED)
