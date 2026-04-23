@@ -447,6 +447,84 @@ def apply_fp4_cache_patch() -> bool:
             "skipping get_kv_cache_shape patch"
         )
 
+    # ── Patch 4: GPUModelRunner._reshape_kv_cache_tensors dtype override ──
+    # The method does `.view(dtype).view(shape)` where dtype=bfloat16.
+    # For FP4, we need `.view(torch.int8).view(shape)` since the raw
+    # tensor is int8 and FP4 packed data is byte-level.
+    try:
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+        import torch
+
+        _orig_reshape = GPUModelRunner._reshape_kv_cache_tensors
+        _originals["GPUModelRunner._reshape_kv_cache_tensors"] = _orig_reshape
+
+        def _fp4_reshape_kv_cache_tensors(self, kv_cache_config, kv_cache_raw_tensors, kernel_block_sizes):
+            """Patched reshape that uses int8 view for FP4 cache tensors."""
+            if not is_fp4_enabled():
+                return _orig_reshape(self, kv_cache_config, kv_cache_raw_tensors, kernel_block_sizes)
+
+            from vllm.v1.kv_cache_interface import AttentionSpec
+            import itertools
+
+            kv_caches = {}
+            for group in self._kv_cache_spec_attn_group_iterator():
+                kv_cache_spec = group.kv_cache_spec
+                attn_backend = group.backend
+                if group.kv_cache_group_id == len(kernel_block_sizes):
+                    continue
+                kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
+                for layer_name in group.layer_names:
+                    if layer_name in self.runner_only_attn_layers:
+                        continue
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+                    num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+                    if isinstance(kv_cache_spec, AttentionSpec):
+                        num_blocks_per_kv_block = (
+                            kv_cache_spec.block_size // kernel_block_size
+                        )
+                        kernel_num_blocks = num_blocks * num_blocks_per_kv_block
+                        kv_cache_shape = attn_backend.get_kv_cache_shape(
+                            kernel_num_blocks,
+                            kernel_block_size,
+                            kv_cache_spec.num_kv_heads,
+                            kv_cache_spec.head_size,
+                            cache_dtype_str=self.cache_config.cache_dtype,
+                        )
+                        try:
+                            kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
+                            assert len(kv_cache_stride_order) == len(kv_cache_shape)
+                        except (AttributeError, NotImplementedError):
+                            kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
+                        kv_cache_shape = tuple(
+                            kv_cache_shape[i] for i in kv_cache_stride_order
+                        )
+                        inv_order = [
+                            kv_cache_stride_order.index(i)
+                            for i in range(len(kv_cache_stride_order))
+                        ]
+                        # FP4: view as int8 (not bfloat16) — byte-level packing
+                        kv_caches[layer_name] = (
+                            raw_tensor
+                            .view(torch.int8)  # NOT kv_cache_spec.dtype
+                            .view(kv_cache_shape)
+                            .permute(*inv_order)
+                        )
+                        logger.info(
+                            "[TQ-FP4] Reshaped %s: shape=%s dtype=int8 blocks=%d",
+                            layer_name, tuple(kv_caches[layer_name].shape), num_blocks,
+                        )
+                    else:
+                        # Non-attention layers (Mamba etc.) — use original logic
+                        # This shouldn't happen for our use case
+                        logger.warning("[TQ-FP4] Non-attention layer %s, using original reshape", layer_name)
+            return kv_caches
+
+        GPUModelRunner._reshape_kv_cache_tensors = _fp4_reshape_kv_cache_tensors
+        logger.info("[TQ-FP4] Patched GPUModelRunner._reshape_kv_cache_tensors")
+    except ImportError as e:
+        logger.debug("[TQ-FP4] GPUModelRunner not available: %s", e)
+
     _FP4_CACHE_PATCHED = True
 
     # Log summary
