@@ -186,6 +186,45 @@ def turbo4_compress_and_scatter_fp4(
 # FP4 Paged Attention (v9 kernel call)
 # ============================================================================
 
+# ── Pre-allocated decode buffers for CUDA graph compatibility ──
+# These avoid torch.empty* inside the attention call, which breaks
+# HIP graph capture/replay on gfx950 at conc>=8.
+_PA_BUFFERS: dict[torch.device, dict] = {}
+_PA_MAX_BATCH = 4096
+_PA_MAX_SPLITS = 32  # Must cover _get_optimal_splits range
+
+
+def _ensure_pa_buffers(
+    device: torch.device,
+    num_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+) -> dict:
+    """Pre-allocate output + workspace buffers once per device."""
+    if device in _PA_BUFFERS:
+        return _PA_BUFFERS[device]
+
+    ws_size = _PA_MAX_BATCH * num_heads * _PA_MAX_SPLITS
+    bufs = {
+        "output": torch.zeros(
+            (_PA_MAX_BATCH, num_heads, head_dim),
+            dtype=torch.float16, device=device,
+        ),
+        "wm": torch.zeros(ws_size, dtype=torch.float32, device=device),
+        "wl": torch.zeros(ws_size, dtype=torch.float32, device=device),
+        "wa": torch.zeros(
+            ws_size * head_dim, dtype=torch.float32, device=device,
+        ),
+    }
+    _PA_BUFFERS[device] = bufs
+    logger.info(
+        "[TQ-FP4] Pre-allocated PA decode buffers on %s "
+        "(batch=%d, splits=%d)",
+        device, _PA_MAX_BATCH, _PA_MAX_SPLITS,
+    )
+    return bufs
+
+
 def fp4_paged_attention_v9(
     query: torch.Tensor,            # [batch, num_heads, head_dim] FP16/BF16
     k_cache: torch.Tensor,          # [num_blocks, block_size, num_kv_heads, head_dim//2] uint8
@@ -201,8 +240,11 @@ def fp4_paged_attention_v9(
     The v9 kernel achieves 10.2µs on MI355X — faster than both
     SDPA BF16 (12µs) and AITER FP8 (48µs).
 
+    Uses pre-allocated fp16 output + workspace buffers for CUDA/HIP
+    graph compatibility (no torch.empty* during capture/replay).
+
     Returns:
-        output: [batch, num_heads, head_dim] same dtype as query
+        output: [batch, num_heads, head_dim] fp16 (pre-allocated slice)
     """
     lib = _load_fp4_pa_kernel()
 
@@ -216,16 +258,12 @@ def fp4_paged_attention_v9(
     nsplits = _get_optimal_splits(max_ctx)
     max_blocks = block_tables.shape[1]
 
-    # Output tensor in same dtype as query
-    output = torch.empty_like(query)
-
-    # Workspace for split-K reduction
-    workspace_size = batch * num_heads * nsplits
-    wm = torch.empty(workspace_size, dtype=torch.float32, device=query.device)
-    wl = torch.empty(workspace_size, dtype=torch.float32, device=query.device)
-    wa = torch.empty(
-        workspace_size * head_dim, dtype=torch.float32, device=query.device
-    )
+    # Use pre-allocated buffers (CUDA-graph-safe)
+    bufs = _ensure_pa_buffers(query.device, num_heads, head_dim, query.dtype)
+    output = bufs["output"][:batch]
+    wm = bufs["wm"]
+    wl = bufs["wl"]
+    wa = bufs["wa"]
 
     stream = torch.cuda.current_stream().cuda_stream
 
