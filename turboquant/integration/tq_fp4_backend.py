@@ -677,7 +677,10 @@ def _make_fp4_backend_classes():
 
         @staticmethod
         def get_name() -> str:
-            return "TURBOQUANT_FP4"
+            # Must return "ROCM_ATTN" to pass vLLM's backend enum validation
+            # in worker processes. The monkey-patch swaps the implementation
+            # class but keeps the registered name.
+            return "ROCM_ATTN"
 
         @staticmethod
         def get_impl_cls() -> type[TurboQuantFP4Impl]:
