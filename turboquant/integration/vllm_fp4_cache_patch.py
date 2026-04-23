@@ -500,50 +500,56 @@ def _make_fp4_forward(orig_fn):
         packed_dim = head_dim // 2    # 64
         scale_dim = head_dim // 32    # 4
 
-        # Selective dequant: only dequantize blocks referenced by current batch.
-        # Full-cache dequant is too expensive (OOM with ~800K blocks).
-        # We gather only the active blocks via block_table, dequant those,
-        # and build a compact bf16 cache with remapped block indices.
+        # CUDA-graph-safe dequant: use index_select on block_table indices.
+        # No .unique(), .flatten(), or dynamic allocation — all ops are
+        # fixed-shape tensor operations that can be captured in a graph.
         import torch
 
         block_table = attn_metadata.block_table  # [batch, max_blocks_per_seq] int32
         if block_table is not None and block_table.numel() > 0:
-            # Get unique blocks actually referenced
-            unique_blocks = block_table.flatten().unique()
-            # Remove padding (-1 or 0 depending on vLLM version)
-            unique_blocks = unique_blocks[unique_blocks >= 0]
-            n_active = unique_blocks.shape[0]
+            batch_size = block_table.shape[0]
+            max_blocks_per_seq = block_table.shape[1]
 
-            # Gather active blocks from FP4 cache
-            # kv_cache: [num_blocks, 2, block_size, num_kv_heads, 68]
-            active_kv = kv_cache[unique_blocks]  # [n_active, 2, bs, kv_heads, 68]
+            # Clamp block indices to valid range (padding may use -1 or large values)
+            bt_clamped = block_table.clamp(min=0, max=num_blocks - 1).long()
 
-            # Dequantize only active blocks
-            active_k, active_v = active_kv.unbind(1)
-            k_packed = active_k[..., :packed_dim].view(torch.uint8)
-            k_scales = active_k[..., packed_dim:packed_dim + scale_dim].view(torch.uint8)
-            v_packed = active_v[..., :packed_dim].view(torch.uint8)
-            v_scales = active_v[..., packed_dim:packed_dim + scale_dim].view(torch.uint8)
+            # Gather all referenced blocks: [batch * max_blocks_per_seq, 2, bs, kv_heads, 68]
+            bt_flat = bt_clamped.reshape(-1)  # [batch * max_blocks_per_seq]
+            gathered_kv = kv_cache[bt_flat]   # index_select on dim 0 — graph-safe
+
+            # Reshape to [batch, max_blocks_per_seq, 2, block_size, kv_heads, 68]
+            gathered_kv = gathered_kv.reshape(
+                batch_size, max_blocks_per_seq, 2, block_size, num_kv_heads, fp4_dim
+            )
+
+            # Dequantize: split K/V, extract packed data and scales
+            gathered_k = gathered_kv[:, :, 0]  # [batch, max_blk, bs, kv_heads, 68]
+            gathered_v = gathered_kv[:, :, 1]
+
+            k_packed = gathered_k[..., :packed_dim].contiguous().view(torch.uint8)
+            k_scales = gathered_k[..., packed_dim:packed_dim + scale_dim].contiguous().view(torch.uint8)
+            v_packed = gathered_v[..., :packed_dim].contiguous().view(torch.uint8)
+            v_scales = gathered_v[..., packed_dim:packed_dim + scale_dim].contiguous().view(torch.uint8)
 
             k_bf16 = dequantize_fp4_e2m1(k_packed, k_scales, head_dim)
             v_bf16 = dequantize_fp4_e2m1(v_packed, v_scales, head_dim)
 
-            # Build compact bf16 cache: [n_active, 2, bs, kv_heads, head_dim]
+            # Reshape back to paged format: [batch * max_blocks_per_seq, 2, bs, kv_heads, head_dim]
+            n_gathered = batch_size * max_blocks_per_seq
+            k_bf16 = k_bf16.reshape(n_gathered, block_size, num_kv_heads, head_dim)
+            v_bf16 = v_bf16.reshape(n_gathered, block_size, num_kv_heads, head_dim)
             kv_cache_bf16 = torch.stack([k_bf16, v_bf16], dim=1)
+            # kv_cache_bf16: [n_gathered, 2, block_size, kv_heads, head_dim]
 
-            # Remap block_table to point into the compact cache
-            # Create reverse mapping: original_block_idx -> compact_idx
-            remap = torch.full((num_blocks,), -1, dtype=torch.int32,
-                               device=block_table.device)
-            compact_idx = torch.arange(n_active, dtype=torch.int32,
-                                       device=block_table.device)
-            remap[unique_blocks.long()] = compact_idx
-            block_table_remapped = remap[block_table.long()]
+            # Remap block_table to sequential indices [0, 1, 2, ...]
+            block_table_remapped = torch.arange(
+                n_gathered, dtype=torch.int32, device=block_table.device
+            ).reshape(batch_size, max_blocks_per_seq)
 
-            # Replace attn_metadata's block_table with remapped version
-            attn_metadata = attn_metadata._replace(block_table=block_table_remapped) \
-                if hasattr(attn_metadata, '_replace') else attn_metadata
-            if not hasattr(attn_metadata, '_replace'):
+            # Replace block_table in metadata
+            if hasattr(attn_metadata, '_replace'):
+                attn_metadata = attn_metadata._replace(block_table=block_table_remapped)
+            else:
                 attn_metadata.block_table = block_table_remapped
         else:
             # No block_table (prefill only) — create empty bf16 cache
