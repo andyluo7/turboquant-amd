@@ -702,18 +702,18 @@ def _make_fp4_backend_classes():
             """KV cache shape with FP4 packing.
 
             Standard:  [2, num_blocks, block_size, num_kv_heads, head_size]
-            FP4:       [2, num_blocks, block_size, num_kv_heads, head_size//2]
+            FP4:       [2, num_blocks, block_size, num_kv_heads, head_size//2 + head_size//32]
 
-            The tensor dtype is uint8, so each byte holds 2 FP4 values.
-            This gives 2x the token capacity vs FP8 for the same memory.
-
-            E8M0 scale buffers ([num_blocks, block_size, num_kv_heads, head_size//32])
-            are allocated separately by _FP4ScaleManager.
+            The tensor dtype is uint8. Last dim = 64+4=68 for head_size=128:
+              [:64]  FP4 E2M1 packed pairs (2 values per byte)
+              [64:68] E8M0 per-group scales (1 per 32 elements)
+            This gives ~1.88x token capacity vs FP8 for the same memory.
             """
             if block_size % 16 != 0:
                 raise ValueError("Block size must be a multiple of 16.")
-            packed_head_size = head_size // 2
-            return (2, num_blocks, block_size, num_kv_heads, packed_head_size)
+            # FP4 packed data + inline E8M0 scales
+            fp4_dim = head_size // 2 + head_size // 32  # 64+4=68 for head_size=128
+            return (2, num_blocks, block_size, num_kv_heads, fp4_dim)
 
         @classmethod
         def supports_compute_capability(
