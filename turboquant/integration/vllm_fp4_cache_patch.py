@@ -413,6 +413,40 @@ def apply_fp4_cache_patch() -> bool:
             "skipping get_kv_cache_shape patch"
         )
 
+    # Also patch RocmAttnBackend (used when VLLM_ROCM_USE_AITER=0)
+    try:
+        from vllm.v1.attention.backends.rocm_attn import RocmAttnBackend
+        _originals["RocmAttnBackend.get_kv_cache_shape"] = (
+            RocmAttnBackend.get_kv_cache_shape
+        )
+
+        @staticmethod
+        def _fp4_rocm_get_kv_cache_shape(
+            num_blocks: int,
+            block_size: int,
+            num_kv_heads: int,
+            head_size: int,
+            cache_dtype_str: str = "auto",
+        ) -> tuple[int, ...]:
+            if is_fp4_enabled():
+                return fp4_get_kv_cache_shape(
+                    num_blocks, block_size, num_kv_heads, head_size,
+                    cache_dtype_str,
+                )
+            if block_size % 16 != 0:
+                raise ValueError("Block size must be a multiple of 16.")
+            return (2, num_blocks, block_size, num_kv_heads, head_size)
+
+        RocmAttnBackend.get_kv_cache_shape = _fp4_rocm_get_kv_cache_shape
+        logger.info(
+            "[TQ-FP4] Patched RocmAttnBackend.get_kv_cache_shape"
+        )
+    except ImportError:
+        logger.debug(
+            "[TQ-FP4] RocmAttnBackend not available, "
+            "skipping get_kv_cache_shape patch"
+        )
+
     _FP4_CACHE_PATCHED = True
 
     # Log summary
