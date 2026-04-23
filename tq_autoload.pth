@@ -1,0 +1,1 @@
+import os; exec("if os.environ.get('TQ_FP4_ENABLE') == '1':\n    try:\n        from turboquant.integration.vllm_fp4_cache_patch import autoload_fp4_cache_patch\n        autoload_fp4_cache_patch()\n    except Exception:\n        pass\n")

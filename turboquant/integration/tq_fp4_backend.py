@@ -759,6 +759,32 @@ def patch_vllm_fp4(
         logger.warning("[TurboQuant FP4] Already patched, skipping")
         return
 
+    # ── Apply FP4 cache allocation patch first ──
+    # This patches AttentionSpec.real_page_size_bytes, _reshape_kv_cache,
+    # and get_kv_cache_shape so vLLM allocates the right amount of memory
+    # for FP4 packed KV cache (68 bytes/head vs 128+ for FP8/BF16).
+    try:
+        from turboquant.integration.vllm_fp4_cache_patch import (
+            apply_fp4_cache_patch,
+            is_fp4_enabled,
+        )
+        # Ensure the env var is set for the cache patch
+        if not is_fp4_enabled():
+            os.environ["TQ_FP4_ENABLE"] = "1"
+            logger.info("[TurboQuant FP4] Set TQ_FP4_ENABLE=1")
+        apply_fp4_cache_patch()
+    except ImportError:
+        logger.warning(
+            "[TurboQuant FP4] vllm_fp4_cache_patch not available — "
+            "KV cache allocation will use standard sizes. "
+            "Install turboquant or add it to PYTHONPATH."
+        )
+    except Exception as e:
+        logger.warning(
+            "[TurboQuant FP4] Cache patch failed: %s — "
+            "continuing with standard allocation", e
+        )
+
     # Pre-load kernel
     try:
         _load_fp4_pa_kernel()
@@ -803,8 +829,11 @@ def patch_vllm_fp4(
         f"  Kernel: {_FP4_PA_SO_PATH}\n"
         f"  Head size: {head_size}\n"
         f"  KV cache: uint8 packed FP4 E2M1 + E8M0 scales\n"
-        f"  Capacity: 2x vs FP8\n"
-        f"  Decode: FP4 PA v9 (~10µs on MI355X)"
+        f"  FP4 bytes/head: {head_size // 2 + head_size // 32} "
+        f"(data: {head_size // 2}, scales: {head_size // 32})\n"
+        f"  Capacity: ~1.88x vs FP8, ~3.76x vs BF16\n"
+        f"  Decode: FP4 PA v9 (~10µs on MI355X)\n"
+        f"  Cache patch: {'active' if os.environ.get('TQ_FP4_ENABLE') == '1' else 'inactive'}"
     )
 
 
@@ -818,6 +847,15 @@ def unpatch_vllm():
 
     # Clear the cache so next call re-selects normally
     selector._cached_get_attn_backend.cache_clear()
+
+    # Revert cache allocation patches
+    try:
+        from turboquant.integration.vllm_fp4_cache_patch import (
+            revert_fp4_cache_patch,
+        )
+        revert_fp4_cache_patch()
+    except ImportError:
+        pass
 
     _PATCHED = False
     logger.info("[TurboQuant FP4] Unpatched — reverted to default backend")
